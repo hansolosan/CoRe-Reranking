@@ -1,0 +1,363 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+
+\title{Retrieval Head Selection in Attention-Based Reranking:\\Current Methods and Proposed Optimizations}
+\author{Radu Florian\\IBM Research\\raduf@us.ibm.com}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report describes the Contrastive Retrieval (CoRe) head detection algorithm used for identifying retrieval-relevant attention heads in large language models. We formalize the current greedy selection approach and propose learned optimization methods using logistic regression with sparsity-inducing regularization to improve head selection efficiency. We further propose listwise cross-entropy loss as an alternative to pointwise sigmoid, which better aligns with the contrastive nature of the ranking task.
+\end{abstract}
+
+\section{Introduction}
+
+Large language models (LLMs) contain numerous attention heads, but only a small fraction ($\sim$1\%) contribute meaningfully to retrieval tasks. The CoRe algorithm \cite{core} identifies these ``retrieval heads'' by measuring how well each head distinguishes relevant documents from hard negatives. This report formalizes the current selection method and proposes learned alternatives.
+
+\section{Notation}
+
+Let $\mathcal{M}$ be a transformer model with:
+\begin{itemize}
+    \item $L$ layers and $H$ heads per layer
+    \item Total heads: $N = L \times H$
+    \item Head indexed by $(l, h)$ where $l \in \{1, \ldots, L\}$ and $h \in \{1, \ldots, H\}$
+\end{itemize}
+
+For a query-document pair:
+\begin{itemize}
+    \item $q$: query text with token span $[q_s, q_e]$
+    \item $d^+$: positive document with token span $[d^+_s, d^+_e]$
+    \item $\{d^-_j\}_{j=1}^{M}$: hard negative documents with spans $[d^-_{j,s}, d^-_{j,e}]$
+\end{itemize}
+
+\section{Current Method: Contrastive Retrieval (CoRe)}
+
+\subsection{Attention Weight Computation}
+
+For each head $(l, h)$, we compute attention weights using the standard scaled dot-product attention. Given query states $Q^{(l,h)} \in \mathbb{R}^{|q| \times d}$ and key states $K^{(l,h)} \in \mathbb{R}^{n \times d}$:
+
+\begin{equation}
+    A^{(l,h)} = \text{softmax}\left(\frac{Q^{(l,h)} (K^{(l,h)})^\top}{\sqrt{d}} + M_{\text{causal}}\right)
+\end{equation}
+
+where $M_{\text{causal}}$ is the causal attention mask and $d$ is the head dimension.
+
+\subsection{Document Attention Aggregation}
+
+The attention score from query tokens to a document $d$ is computed by summing attention weights over the document's token span:
+
+\begin{equation}
+    a^{(l,h)}(q \rightarrow d) = \sum_{i=q_s}^{q_e} \sum_{j=d_s}^{d_e} A^{(l,h)}_{i,j}
+\end{equation}
+
+In practice, query token attention is averaged before summing over document tokens:
+
+\begin{equation}
+    a^{(l,h)}(q \rightarrow d) = \sum_{j=d_s}^{d_e} \bar{A}^{(l,h)}_{j}, \quad \text{where} \quad \bar{A}^{(l,h)} = \frac{1}{|q|} \sum_{i=q_s}^{q_e} A^{(l,h)}_{i,:}
+\end{equation}
+
+\subsection{Contrastive Head Scoring (SCoRe)}
+
+For head detection, document-level scores are computed \textbf{without} contextual calibration (unlike reranking). This preserves intrinsic attention biases that help distinguish retrieval heads from low-quality heads:
+
+\begin{equation}
+    s^{(l,h)}_{d_i} = \sum_{j \in T_{d_i}} s^{(l,h)}_{d_i,j;q}
+\end{equation}
+
+For a single query $q$ with positive document $d^+$ and hard negatives $\{d^-_j\}_{j=1}^{M}$, the contrastive retrieval score (SCoRe) is computed via softmax:
+
+\begin{equation}
+    \text{SCoRe}^{(l,h)}(q) = \frac{\exp\left(s^{(l,h)}_{d^+} / t\right)}{\exp\left(s^{(l,h)}_{d^+} / t\right) + \sum_{j=1}^{M} \exp\left(s^{(l,h)}_{d^-_j} / t\right)}
+\end{equation}
+
+where $t$ is the contrastive temperature parameter (default: $t=0.001$ for Mistral/Granite, $t=0.1$ for Llama/Phi).
+
+\subsection{Global Head Score}
+
+The final score for each head is the mean across all queries in the detection set $\mathcal{Q}$:
+
+\begin{equation}
+    S^{(l,h)} = \frac{1}{|\mathcal{Q}|} \sum_{q \in \mathcal{Q}} \text{SCoRe}^{(l,h)}(q)
+\end{equation}
+
+\textbf{Detection data:} CoRe uses 1000 samples from the Natural Questions (NQ) training set. Each sample contains a query, one positive document, and 49 hard negatives mined using a dense retriever. The positive document is placed in different positions (5 variations), yielding 5000 total samples per model.
+
+\subsection{Greedy Head Selection}
+
+The current method selects the top-$k$ heads by score:
+
+\begin{equation}
+    \mathcal{H}_k = \underset{\mathcal{H} \subset \{(l,h)\}, |\mathcal{H}|=k}{\arg\max} \sum_{(l,h) \in \mathcal{H}} S^{(l,h)}
+\end{equation}
+
+This simplifies to sorting heads by $S^{(l,h)}$ and selecting the top $k$ (typically $k=8$).
+
+\begin{algorithm}
+\caption{CoRe Head Selection (Current Method)}
+\begin{algorithmic}[1]
+\Require Detection queries $\mathcal{Q}$, number of heads $k$
+\State Initialize $S^{(l,h)} \gets 0$ for all $(l,h)$
+\For{each query $q \in \mathcal{Q}$}
+    \State Compute attention weights $A^{(l,h)}$ for all heads
+    \State Compute contrastive scores $\text{SCoRe}^{(l,h)}(q)$ using Eq. (5)
+    \State $S^{(l,h)} \gets S^{(l,h)} + \text{SCoRe}^{(l,h)}(q)$
+\EndFor
+\State $S^{(l,h)} \gets S^{(l,h)} / |\mathcal{Q}|$ for all $(l,h)$
+\State Sort heads by $S^{(l,h)}$ in descending order
+\State \Return Top-$k$ heads
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Key Empirical Findings}
+
+The original CoRe paper \cite{core} reports several important findings:
+
+\begin{enumerate}
+    \item \textbf{Head concentration in middle layers}: CoRe heads are primarily located in layers 8--16 (for 32-layer models), not in early or late layers. Late layers are primarily responsible for token generation, not retrieval.
+
+    \item \textbf{Layer pruning}: Removing the final 50\% of model layers preserves near-identical re-ranking accuracy while reducing GPU memory by $\sim$40\% and inference latency by $\sim$20\%.
+
+    \item \textbf{Optimal head count}: Peak re-ranking accuracy is achieved with fewer than 10 heads (typically 4--9 heads). Adding more heads introduces noise and degrades performance.
+
+    \item \textbf{Comparison with QR heads}: CoRe heads overlap minimally with QR heads (query-relevance heads that use absolute attention). For Llama-3.1 8B, only 3 of the top 8 heads overlap between methods.
+
+    \item \textbf{Dataset generalization}: CoRe heads detected on NQ generalize effectively to BEIR benchmark, multilingual (MLDR), and multi-hop (MuSiQue) tasks without re-detection.
+\end{enumerate}
+
+\section{Proposed Optimization: Learned Head Weighting}
+
+The greedy selection treats all selected heads equally during reranking. We propose learning optimal head weights using logistic regression on attention features.
+
+\subsection{Feature Extraction}
+
+For each query-document pair $(q, d)$, extract attention features from all heads:
+
+\begin{equation}
+    \mathbf{x}_{q,d} = \left[ a^{(1,1)}(q \rightarrow d), \ldots, a^{(L,H)}(q \rightarrow d) \right]^\top \in \mathbb{R}^{N}
+\end{equation}
+
+\subsection{Logistic Regression Formulation}
+
+Given a training set of query-document pairs with relevance labels $y \in \{0, 1\}$:
+
+\begin{equation}
+    P(y=1 | q, d) = \sigma\left(\mathbf{w}^\top \mathbf{x}_{q,d} + b\right)
+\end{equation}
+
+where $\sigma(z) = 1/(1+e^{-z})$ is the sigmoid function and $\mathbf{w} \in \mathbb{R}^{N}$ are learnable head weights.
+
+\subsection{Training Objective}
+
+Minimize the binary cross-entropy loss:
+
+\begin{equation}
+    \mathcal{L}_{\text{BCE}} = -\frac{1}{|\mathcal{D}|} \sum_{(q,d,y) \in \mathcal{D}} \left[ y \log \hat{y} + (1-y) \log(1-\hat{y}) \right]
+\end{equation}
+
+where $\hat{y} = P(y=1|q,d)$.
+
+\subsection{Pairwise Ranking Loss (Alternative)}
+
+For ranking, a pairwise loss may be more appropriate:
+
+\begin{equation}
+    \mathcal{L}_{\text{rank}} = \frac{1}{|\mathcal{P}|} \sum_{(q, d^+, d^-) \in \mathcal{P}} \max\left(0, \gamma - (\mathbf{w}^\top \mathbf{x}_{q,d^+} - \mathbf{w}^\top \mathbf{x}_{q,d^-})\right)
+\end{equation}
+
+where $\gamma$ is a margin hyperparameter and $\mathcal{P}$ is the set of (query, positive, negative) triplets.
+
+\subsection{Listwise Cross-Entropy Loss}
+
+Instead of treating each document independently with a sigmoid, we can model the ranking problem as multi-class classification over documents using softmax and cross-entropy. This approach, known as listwise learning-to-rank, jointly considers all candidate documents for a query.
+
+For a query $q$ with candidate documents $\{d_1, \ldots, d_K\}$ where $d^+ = d_{y^*}$ is the positive document, define the relevance score:
+
+\begin{equation}
+    f(q, d_i) = \mathbf{w}^\top \mathbf{x}_{q,d_i} + b
+\end{equation}
+
+The probability of document $d_i$ being relevant is computed via softmax over all candidates:
+
+\begin{equation}
+    P(d_i | q) = \frac{\exp(f(q, d_i) / t)}{\sum_{j=1}^{K} \exp(f(q, d_j) / t)}
+\end{equation}
+
+where $t$ is a temperature parameter controlling the sharpness of the distribution.
+
+The listwise cross-entropy loss maximizes the probability of the positive document:
+
+\begin{equation}
+    \mathcal{L}_{\text{CE}} = -\frac{1}{|\mathcal{Q}|} \sum_{q \in \mathcal{Q}} \log P(d^+ | q)
+\end{equation}
+
+Expanding:
+
+\begin{equation}
+    \mathcal{L}_{\text{CE}} = -\frac{1}{|\mathcal{Q}|} \sum_{q \in \mathcal{Q}} \left[ \frac{f(q, d^+)}{t} - \log \sum_{j=1}^{K} \exp\left(\frac{f(q, d_j)}{t}\right) \right]
+\end{equation}
+
+\subsubsection{Advantages over Pointwise Sigmoid}
+
+\begin{itemize}
+    \item \textbf{Direct ranking optimization}: Cross-entropy directly optimizes the ranking of positive over negatives, mirroring the evaluation metric
+    \item \textbf{Harder negative emphasis}: Softmax naturally emphasizes hard negatives (documents with high scores), while sigmoid treats all negatives equally
+    \item \textbf{Calibrated probabilities}: Produces a proper probability distribution over documents, enabling confidence estimation
+    \item \textbf{Consistency with CoRe}: Mirrors the original CoRe head scoring formula (Eq. 5), enabling direct comparison
+\end{itemize}
+
+\subsubsection{Connection to InfoNCE}
+
+The listwise cross-entropy is equivalent to the InfoNCE contrastive loss commonly used in representation learning:
+
+\begin{equation}
+    \mathcal{L}_{\text{InfoNCE}} = -\log \frac{\exp(f(q, d^+) / t)}{\exp(f(q, d^+) / t) + \sum_{j=1}^{M} \exp(f(q, d^-_j) / t)}
+\end{equation}
+
+This connection suggests that the learned weights $\mathbf{w}$ can be interpreted as optimizing a contrastive objective over head attention features.
+
+\subsubsection{Multi-Positive Extension}
+
+When multiple relevant documents exist for a query, use the multi-label softmax formulation:
+
+\begin{equation}
+    \mathcal{L}_{\text{CE-multi}} = -\frac{1}{|\mathcal{Q}|} \sum_{q \in \mathcal{Q}} \frac{1}{|D^+_q|} \sum_{d^+ \in D^+_q} \log P(d^+ | q)
+\end{equation}
+
+where $D^+_q$ is the set of positive documents for query $q$.
+
+\section{Sparsity-Inducing Regularization}
+
+To automatically select a minimal set of heads, we add regularization terms that encourage sparsity in $\mathbf{w}$.
+
+\subsection{L1 Regularization (Lasso)}
+
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{BCE}} + \lambda_1 \|\mathbf{w}\|_1
+\end{equation}
+
+where $\|\mathbf{w}\|_1 = \sum_{i=1}^{N} |w_i|$.
+
+L1 regularization drives many weights exactly to zero, effectively performing feature selection. The regularization strength $\lambda_1$ controls sparsity:
+\begin{itemize}
+    \item Higher $\lambda_1$: fewer non-zero weights (more aggressive head pruning)
+    \item Lower $\lambda_1$: more heads retained
+\end{itemize}
+
+\subsection{Elastic Net (L1 + L2)}
+
+Combines L1 sparsity with L2 stability:
+
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{BCE}} + \lambda_1 \|\mathbf{w}\|_1 + \lambda_2 \|\mathbf{w}\|_2^2
+\end{equation}
+
+This is useful when heads are correlated, as L2 encourages grouping of similar heads while L1 selects among groups.
+
+\subsection{Group Lasso (Layer-wise Sparsity)}
+
+To encourage pruning entire layers:
+
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{BCE}} + \lambda_g \sum_{l=1}^{L} \|\mathbf{w}^{(l)}\|_2
+\end{equation}
+
+where $\mathbf{w}^{(l)} = [w_{(l,1)}, \ldots, w_{(l,H)}]^\top$ contains weights for all heads in layer $l$.
+
+\section{Implementation}
+
+\subsection{Training Data Preparation}
+
+Using the existing CoRe detection data:
+
+\begin{enumerate}
+    \item For each query in \texttt{nq\_core.json}, extract attention features for positive and negative documents
+    \item Create binary labels: $y=1$ for positive, $y=0$ for negatives
+    \item Split into train/validation sets
+\end{enumerate}
+
+\subsection{Optimization}
+
+For L1-regularized logistic regression, use proximal gradient descent or coordinate descent:
+
+\begin{algorithm}
+\caption{Proximal Gradient Descent for L1-Regularized Logistic Regression}
+\begin{algorithmic}[1]
+\Require Learning rate $\eta$, regularization $\lambda_1$
+\State Initialize $\mathbf{w} \gets \mathbf{0}$
+\While{not converged}
+    \State $\mathbf{g} \gets \nabla_{\mathbf{w}} \mathcal{L}_{\text{BCE}}$ \Comment{Gradient of smooth part}
+    \State $\mathbf{w} \gets \mathbf{w} - \eta \mathbf{g}$ \Comment{Gradient step}
+    \State $\mathbf{w} \gets \text{sign}(\mathbf{w}) \odot \max(|\mathbf{w}| - \eta\lambda_1, 0)$ \Comment{Proximal step (soft thresholding)}
+\EndWhile
+\State \Return $\mathbf{w}$
+\end{algorithmic}
+\end{algorithm}
+
+Alternatively, use scikit-learn's \texttt{LogisticRegression} with \texttt{penalty='l1'} and \texttt{solver='saga'}.
+
+\subsection{Head Selection from Learned Weights}
+
+After training, select heads with non-zero weights:
+
+\begin{equation}
+    \mathcal{H}_{\text{learned}} = \{(l,h) : |w_{(l,h)}| > \epsilon\}
+\end{equation}
+
+where $\epsilon$ is a small threshold (e.g., $10^{-6}$).
+
+\section{Expected Benefits}
+
+\begin{enumerate}
+    \item \textbf{Optimal weighting}: Instead of equal contribution, heads are weighted by learned importance
+    \item \textbf{Automatic head count}: L1 regularization automatically determines the number of heads
+    \item \textbf{Interaction modeling}: Logistic regression can capture which head combinations work well together
+    \item \textbf{Task adaptation}: Weights can be tuned for specific retrieval tasks or domains
+\end{enumerate}
+
+\section{Experimental Plan}
+
+\begin{enumerate}
+    \item Extract attention features for all query-document pairs in the detection set
+    \item Train logistic regression with varying $\lambda_1 \in \{10^{-4}, 10^{-3}, 10^{-2}, 10^{-1}, 1\}$
+    \item Compare reranking performance (NDCG@1/5/10) against greedy selection
+    \item Analyze sparsity patterns: which layers/heads are consistently selected?
+    \item Evaluate generalization to out-of-domain BEIR datasets
+    \item \textbf{Loss function comparison}: Compare pointwise sigmoid (BCE) vs. listwise cross-entropy:
+    \begin{itemize}
+        \item Train separate models with $\mathcal{L}_{\text{BCE}}$ and $\mathcal{L}_{\text{CE}}$ under identical regularization
+        \item Vary temperature $t \in \{0.001, 0.01, 0.1, 1.0\}$ for cross-entropy
+        \item Measure ranking metrics and analyze weight distributions
+        \item Hypothesis: Cross-entropy should better match the contrastive nature of CoRe head detection
+    \end{itemize}
+    \item \textbf{Combined loss ablation}: Test weighted combination $\mathcal{L} = \alpha \mathcal{L}_{\text{BCE}} + (1-\alpha) \mathcal{L}_{\text{CE}}$ with $\alpha \in \{0, 0.25, 0.5, 0.75, 1\}$
+\end{enumerate}
+
+\section{Conclusion}
+
+The current CoRe head selection uses a simple greedy approach based on average contrastive scores. We propose replacing this with learned head weights optimized via logistic regression with L1 regularization. We further propose using listwise cross-entropy loss instead of pointwise sigmoid, which better aligns with the contrastive nature of the original CoRe formulation and directly optimizes the ranking objective. This approach offers automatic head count selection, optimal weighting, and potential performance improvements through learned head interactions.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+\bibitem{core}
+Linh Tran, Yulong Li, Radu Florian, and Wei Sun. Less is More: Contrastive Retrieval Heads Improve Attention-Based Re-Ranking. \textit{arXiv preprint arXiv:2510.02219}, 2025.
+
+\bibitem{icr}
+In-Context Reranking, OSU NLP Group, 2024.
+
+\bibitem{lasso}
+Tibshirani, R. (1996). Regression shrinkage and selection via the lasso. \textit{Journal of the Royal Statistical Society: Series B}, 58(1), 267-288.
+
+\bibitem{elastic}
+Zou, H., \& Hastie, T. (2005). Regularization and variable selection via the elastic net. \textit{Journal of the Royal Statistical Society: Series B}, 67(2), 301-320.
+\end{thebibliography}
+
+\end{document}

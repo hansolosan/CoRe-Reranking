@@ -5,6 +5,7 @@ import torch
 class DynamicCacheWithQuery(DynamicCache):
     def __init__(self, query_indices=[]) -> None:
         super().__init__()
+        self._seen_tokens = 0  # Initialize for compatibility with newer transformers
         self._query_indices = query_indices # indices for query vectors to save
         self.query_cache = []
 
