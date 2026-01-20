@@ -10,6 +10,7 @@ Supports two input formats:
 
 import json
 import os
+import gc
 import argparse
 import gzip
 import bz2
@@ -407,6 +408,8 @@ def main():
                         help='Minimum qrels score to be considered positive (default: 1)')
     parser.add_argument('--quantize', type=str, default=None, choices=[None, '4bit', '8bit'],
                         help='Quantization mode: 4bit, 8bit, or None (default: None)')
+    parser.add_argument('--batch_size', type=int, default=100,
+                        help='Number of queries to process before aggressive memory cleanup (default: 100)')
     args = parser.parse_args()
 
     # Determine input file
@@ -456,7 +459,7 @@ def main():
     all_doc_ids = []
     docs_per_query = []
 
-    for sample in tqdm(data, desc="Extracting features"):
+    for sample_idx, sample in enumerate(tqdm(data, desc="Extracting features")):
         # Get query
         query = sample.get('question', sample.get('query', ''))
         query_id = sample.get('idx', '')
@@ -505,6 +508,11 @@ def main():
         all_query_ids.extend([query_id] * len(documents))
         all_doc_ids.extend(doc_ids)
         docs_per_query.append(len(documents))
+
+        # Aggressive memory cleanup every batch_size samples
+        if (sample_idx + 1) % args.batch_size == 0:
+            gc.collect()
+            torch.cuda.empty_cache()
 
     # Stack all features
     all_features = np.vstack(all_features)
