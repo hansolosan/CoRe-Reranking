@@ -14,6 +14,7 @@ import gc
 import argparse
 import gzip
 import bz2
+import time
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -205,6 +206,138 @@ class FeatureExtractor:
 
         return features
 
+    def extract_features_batch(self, queries, documents_list, max_doc_tokens=300):
+        """
+        Extract attention features for a batch of queries.
+
+        Args:
+            queries: list of query texts
+            documents_list: list of document lists (one per query)
+            max_doc_tokens: maximum tokens per document
+
+        Returns:
+            list of features arrays, one per query
+        """
+        batch_size = len(queries)
+        if batch_size == 0:
+            return []
+
+        # Prepare all prompts
+        all_prompts = []
+        all_doc_spans = []
+        all_query_spans = []
+        all_truncated_docs = []
+
+        for query, documents in zip(queries, documents_list):
+            # Truncate documents
+            truncated_docs = []
+            for doc in documents:
+                text = doc.get('paragraph_text', '')
+                words = text.split()[:max_doc_tokens]
+                truncated_docs.append({'paragraph_text': ' '.join(words)})
+            all_truncated_docs.append(truncated_docs)
+
+            prompt, doc_spans, query_span = self.prepare_input(query, truncated_docs)
+            all_prompts.append(prompt)
+            all_doc_spans.append(doc_spans)
+            all_query_spans.append(query_span)
+
+        # Tokenize all prompts with padding
+        tokenized = self.tokenizer(
+            all_prompts,
+            return_tensors='pt',
+            padding=True,
+            return_attention_mask=True
+        ).to(self.llm.device)
+
+        input_ids = tokenized.input_ids
+        attention_mask = tokenized.attention_mask
+
+        # Adjust query spans for padding (padding is on the left by default for causal LMs)
+        # Check if padding is on left or right
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+
+        adjusted_query_spans = []
+        adjusted_doc_spans = []
+        for b in range(batch_size):
+            # Count padding tokens at the start
+            seq = input_ids[b]
+            pad_offset = 0
+            for t in seq:
+                if t == pad_token_id:
+                    pad_offset += 1
+                else:
+                    break
+
+            # Adjust spans
+            q_start, q_end = all_query_spans[b]
+            adjusted_query_spans.append((q_start + pad_offset, q_end + pad_offset))
+
+            adj_doc_spans = []
+            for d_start, d_end in all_doc_spans[b]:
+                adj_doc_spans.append((d_start + pad_offset, d_end + pad_offset))
+            adjusted_doc_spans.append(adj_doc_spans)
+
+        # Process each sample in the batch separately (due to DynamicCacheWithQuery limitation)
+        # But we can still benefit from keeping tensors on GPU
+        all_features = []
+
+        for b in range(batch_size):
+            b_input_ids = input_ids[b:b+1]
+            q_start, q_end = adjusted_query_spans[b]
+            _query_indices = list(range(q_start, q_end + 1))
+            kv_cache = DynamicCacheWithQuery(query_indices=_query_indices)
+
+            with torch.no_grad():
+                output = self.llm(
+                    input_ids=b_input_ids,
+                    use_cache=True,
+                    past_key_values=kv_cache,
+                    output_attentions=True
+                )
+            kv_cache = output.past_key_values
+
+            # Collect key and query caches
+            all_key_cache = []
+            all_query_cache = []
+            for i in range(self.num_layer):
+                all_key_cache.append(kv_cache.key_cache[i][:, :, :q_end + 1])
+                all_query_cache.append(kv_cache.query_cache[i])
+            all_key_cache = torch.stack(all_key_cache)
+            all_query_cache = torch.stack(all_query_cache)
+
+            del output
+            torch.cuda.empty_cache()
+
+            # Compute attention weights
+            attn_weights = self._get_attn_weights(all_key_cache, all_query_cache).to('cuda').squeeze(1)
+            del all_key_cache, all_query_cache
+            torch.cuda.empty_cache()
+
+            # Average over query tokens
+            attn_weights = attn_weights.mean(-2)  # (num_layer, num_head, seq_len)
+
+            # Extract document-level scores
+            doc_spans = adjusted_doc_spans[b]
+            num_docs = len(doc_spans)
+            features = np.zeros((num_docs, self.num_layer * self.num_head), dtype=np.float32)
+
+            for doc_idx, (start, end) in enumerate(doc_spans):
+                doc_attn = attn_weights[:, :, start:end].sum(-1)
+                features[doc_idx] = doc_attn.cpu().numpy().flatten()
+
+            all_features.append(features)
+
+            del attn_weights
+            torch.cuda.empty_cache()
+
+        del tokenized, input_ids, attention_mask
+        torch.cuda.empty_cache()
+
+        return all_features
+
     def prepare_input(self, query, documents):
         """Prepare input prompt and compute token spans for each document."""
         doc_spans = []
@@ -266,6 +399,84 @@ class FeatureExtractor:
         causal_mask = causal_mask.transpose(-1, -2)
         causal_mask = (1 - causal_mask) * torch.finfo(causal_mask.dtype).min
         return causal_mask
+
+
+class MemoryTracker:
+    """Track GPU memory usage during processing."""
+
+    def __init__(self):
+        self.memory_samples = []
+        self.start_time = None
+        self.device = None
+
+    def start(self):
+        """Start tracking memory."""
+        if torch.cuda.is_available():
+            self.device = torch.cuda.current_device()
+            torch.cuda.reset_peak_memory_stats(self.device)
+            self.start_time = time.time()
+            self.memory_samples = []
+            self.sample()
+
+    def sample(self):
+        """Record current memory usage."""
+        if self.device is not None:
+            allocated = torch.cuda.memory_allocated(self.device)
+            reserved = torch.cuda.memory_reserved(self.device)
+            self.memory_samples.append({
+                'time': time.time() - self.start_time if self.start_time else 0,
+                'allocated': allocated,
+                'reserved': reserved
+            })
+
+    def get_stats(self):
+        """Get memory statistics."""
+        if self.device is None or len(self.memory_samples) == 0:
+            return None
+
+        allocated_values = [s['allocated'] for s in self.memory_samples]
+        reserved_values = [s['reserved'] for s in self.memory_samples]
+
+        peak_allocated = torch.cuda.max_memory_allocated(self.device)
+        peak_reserved = torch.cuda.max_memory_reserved(self.device)
+
+        stats = {
+            'peak_allocated_gb': peak_allocated / (1024 ** 3),
+            'peak_reserved_gb': peak_reserved / (1024 ** 3),
+            'avg_allocated_gb': np.mean(allocated_values) / (1024 ** 3),
+            'avg_reserved_gb': np.mean(reserved_values) / (1024 ** 3),
+            'min_allocated_gb': np.min(allocated_values) / (1024 ** 3),
+            'max_allocated_gb': np.max(allocated_values) / (1024 ** 3),
+            'num_samples': len(self.memory_samples),
+            'total_time_seconds': time.time() - self.start_time if self.start_time else 0
+        }
+
+        return stats
+
+    def print_stats(self, num_queries=None):
+        """Print memory statistics."""
+        stats = self.get_stats()
+        if stats is None:
+            print("No GPU memory tracking available", flush=True)
+            return None
+
+        print(f"\n{'='*60}", flush=True)
+        print("GPU Memory Usage Statistics", flush=True)
+        print('='*60, flush=True)
+        print(f"Peak allocated:    {stats['peak_allocated_gb']:.2f} GB", flush=True)
+        print(f"Peak reserved:     {stats['peak_reserved_gb']:.2f} GB", flush=True)
+        print(f"Avg allocated:     {stats['avg_allocated_gb']:.2f} GB", flush=True)
+        print(f"Min allocated:     {stats['min_allocated_gb']:.2f} GB", flush=True)
+        print(f"Max allocated:     {stats['max_allocated_gb']:.2f} GB", flush=True)
+        print(f"Total time:        {stats['total_time_seconds']:.1f} seconds", flush=True)
+        print(f"Memory samples:    {stats['num_samples']}", flush=True)
+
+        if num_queries is not None and stats['total_time_seconds'] > 0:
+            throughput = num_queries / stats['total_time_seconds']
+            stats['throughput_queries_per_sec'] = throughput
+            print(f"Throughput:        {throughput:.2f} queries/sec", flush=True)
+
+        return stats
 
 
 def open_file(filepath, mode='r', encoding='utf-8'):
@@ -408,8 +619,8 @@ def main():
                         help='Minimum qrels score to be considered positive (default: 1)')
     parser.add_argument('--quantize', type=str, default=None, choices=[None, '4bit', '8bit'],
                         help='Quantization mode: 4bit, 8bit, or None (default: None)')
-    parser.add_argument('--batch_size', type=int, default=100,
-                        help='Number of queries to process before aggressive memory cleanup (default: 100)')
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help='Number of queries to process in each batch (default: 1). Higher values may improve throughput but use more memory.')
     args = parser.parse_args()
 
     # Determine input file
@@ -452,6 +663,15 @@ def main():
     extractor = FeatureExtractor(LLM_NAMES[args.llm], prune=args.prune, quantize=args.quantize)
     print(f"Total features per document: {extractor.num_layer * extractor.num_head}", flush=True)
 
+    # Print model memory usage
+    if torch.cuda.is_available():
+        model_memory = torch.cuda.memory_allocated() / (1024 ** 3)
+        print(f"Model memory usage: {model_memory:.2f} GB", flush=True)
+
+    # Initialize memory tracker
+    memory_tracker = MemoryTracker()
+    memory_tracker.start()
+
     # Extract features
     all_features = []
     all_labels = []
@@ -459,60 +679,131 @@ def main():
     all_doc_ids = []
     docs_per_query = []
 
-    for sample_idx, sample in enumerate(tqdm(data, desc="Extracting features")):
-        # Get query
-        query = sample.get('question', sample.get('query', ''))
-        query_id = sample.get('idx', '')
+    # Prepare batches
+    def process_batch(batch_samples):
+        """Process a batch of samples."""
+        batch_queries = []
+        batch_documents = []
+        batch_query_ids = []
+        batch_doc_ids_list = []
+        batch_labels_list = []
 
-        # Get documents
-        documents = sample.get('paragraphs', [])
+        for sample in batch_samples:
+            query = sample.get('question', sample.get('query', ''))
+            query_id = sample.get('idx', '')
+            documents = sample.get('paragraphs', [])
 
-        # Limit documents per query
-        if args.max_docs is not None:
-            documents = documents[:args.max_docs]
+            if args.max_docs is not None:
+                documents = documents[:args.max_docs]
 
-        if len(documents) == 0:
-            continue
+            if len(documents) == 0:
+                continue
 
-        # Extract features
+            batch_queries.append(query)
+            batch_documents.append(documents)
+            batch_query_ids.append(query_id)
+
+            # Get document IDs
+            doc_ids = [d.get('idx', f'doc_{i}') for i, d in enumerate(documents)]
+            batch_doc_ids_list.append(doc_ids)
+
+            # Get labels
+            if input_format == 'head_detection':
+                labels = np.array([1 if d.get('is_positive', False) else 0 for d in documents], dtype=np.int32)
+            elif qrels is not None:
+                labels = np.array([
+                    get_label_from_qrels(query_id, doc_id, qrels, args.relevance_threshold)
+                    for doc_id in doc_ids
+                ], dtype=np.int32)
+            else:
+                labels = np.full(len(documents), -1, dtype=np.int32)
+            batch_labels_list.append(labels)
+
+        if len(batch_queries) == 0:
+            return [], [], [], [], []
+
+        # Extract features for the batch
         try:
-            features = extractor.extract_features(query, documents, max_doc_tokens=args.max_doc_tokens)
+            if len(batch_queries) == 1:
+                # Single query - use original method
+                batch_features = [extractor.extract_features(
+                    batch_queries[0], batch_documents[0], max_doc_tokens=args.max_doc_tokens
+                )]
+            else:
+                # Multiple queries - use batch method
+                batch_features = extractor.extract_features_batch(
+                    batch_queries, batch_documents, max_doc_tokens=args.max_doc_tokens
+                )
         except torch.cuda.OutOfMemoryError:
-            print(f"Warning: OOM for query {query_id} with {len(documents)} docs, skipping", flush=True)
+            print(f"Warning: OOM for batch of {len(batch_queries)} queries, falling back to sequential", flush=True)
             torch.cuda.empty_cache()
-            continue
-        except Exception as e:
-            print(f"Warning: Failed to extract features for query {query_id}: {e}", flush=True)
-            torch.cuda.empty_cache()
-            continue
-
-        # Get document IDs
-        doc_ids = [d.get('idx', f'doc_{i}') for i, d in enumerate(documents)]
-
-        # Get labels
-        if input_format == 'head_detection':
-            # Use is_positive field from head detection data
-            labels = np.array([1 if d.get('is_positive', False) else 0 for d in documents], dtype=np.int32)
-        elif qrels is not None:
-            # Use qrels file for labels
-            labels = np.array([
-                get_label_from_qrels(query_id, doc_id, qrels, args.relevance_threshold)
-                for doc_id in doc_ids
-            ], dtype=np.int32)
-        else:
-            # No labels available
-            labels = np.full(len(documents), -1, dtype=np.int32)
-
-        all_features.append(features)
-        all_labels.append(labels)
-        all_query_ids.extend([query_id] * len(documents))
-        all_doc_ids.extend(doc_ids)
-        docs_per_query.append(len(documents))
-
-        # Aggressive memory cleanup every batch_size samples
-        if (sample_idx + 1) % args.batch_size == 0:
             gc.collect()
+            # Fall back to sequential processing
+            batch_features = []
+            for q, docs in zip(batch_queries, batch_documents):
+                try:
+                    feats = extractor.extract_features(q, docs, max_doc_tokens=args.max_doc_tokens)
+                    batch_features.append(feats)
+                except torch.cuda.OutOfMemoryError:
+                    print(f"Warning: OOM for single query, skipping", flush=True)
+                    batch_features.append(None)
+                    torch.cuda.empty_cache()
+                except Exception as e:
+                    print(f"Warning: Failed to extract features: {e}", flush=True)
+                    batch_features.append(None)
+                    torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"Warning: Batch extraction failed ({e}), falling back to sequential", flush=True)
             torch.cuda.empty_cache()
+            batch_features = []
+            for q, docs in zip(batch_queries, batch_documents):
+                try:
+                    feats = extractor.extract_features(q, docs, max_doc_tokens=args.max_doc_tokens)
+                    batch_features.append(feats)
+                except Exception:
+                    batch_features.append(None)
+                    torch.cuda.empty_cache()
+
+        # Filter out failed extractions
+        valid_features = []
+        valid_labels = []
+        valid_query_ids = []
+        valid_doc_ids = []
+        valid_docs_per_query = []
+
+        for i, feats in enumerate(batch_features):
+            if feats is not None:
+                valid_features.append(feats)
+                valid_labels.append(batch_labels_list[i])
+                valid_query_ids.extend([batch_query_ids[i]] * len(batch_documents[i]))
+                valid_doc_ids.extend(batch_doc_ids_list[i])
+                valid_docs_per_query.append(len(batch_documents[i]))
+
+        return valid_features, valid_labels, valid_query_ids, valid_doc_ids, valid_docs_per_query
+
+    # Process in batches
+    num_samples = len(data)
+    batch_size = args.batch_size
+
+    for batch_start in tqdm(range(0, num_samples, batch_size), desc=f"Extracting features (batch_size={batch_size})"):
+        batch_end = min(batch_start + batch_size, num_samples)
+        batch_samples = data[batch_start:batch_end]
+
+        feats, labels, q_ids, d_ids, dpq = process_batch(batch_samples)
+
+        all_features.extend(feats)
+        all_labels.extend(labels)
+        all_query_ids.extend(q_ids)
+        all_doc_ids.extend(d_ids)
+        docs_per_query.extend(dpq)
+
+        # Sample memory usage and cleanup after each batch
+        memory_tracker.sample()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # Print memory statistics
+    memory_stats = memory_tracker.print_stats(num_queries=len(docs_per_query))
 
     # Stack all features
     all_features = np.vstack(all_features)
@@ -579,6 +870,7 @@ def main():
         'num_layers': extractor.num_layer,
         'num_heads': extractor.num_head,
         'max_doc_tokens': args.max_doc_tokens,
+        'batch_size': args.batch_size,
         'prune': args.prune,
         'quantize': args.quantize,
         'has_labels': has_labels,
@@ -588,7 +880,9 @@ def main():
             'positive': int(n_positive),
             'negative': int(n_negative),
             'unknown': int(n_unknown)
-        }
+        },
+        'memory_stats': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                        for k, v in (memory_stats or {}).items()}
     }
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
