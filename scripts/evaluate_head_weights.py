@@ -13,13 +13,37 @@ from pathlib import Path
 from collections import defaultdict
 
 
-def load_features(llm_name, num_samples):
-    """Load extracted attention features."""
-    feature_file = Path(__file__).parent.parent / 'head_data' / llm_name / f'attention_features_n{num_samples}.npz'
-    if not feature_file.exists():
-        raise FileNotFoundError(f"Feature file not found: {feature_file}")
-    data = np.load(feature_file)
-    return data['features'], data['labels']
+def load_features(feature_file=None, llm_name=None, num_samples=None):
+    """Load extracted attention features.
+
+    Args:
+        feature_file: Path to feature file (if provided, llm_name and num_samples are ignored)
+        llm_name: LLM name for default path construction
+        num_samples: Number of samples for default path construction
+
+    Returns:
+        features, labels arrays
+    """
+    if feature_file is not None:
+        path = Path(feature_file)
+    else:
+        path = Path(__file__).parent.parent / 'head_data' / llm_name / f'attention_features_n{num_samples}.npz'
+
+    if not path.exists():
+        raise FileNotFoundError(f"Feature file not found: {path}")
+
+    data = np.load(path, allow_pickle=True)
+
+    # Handle different feature file formats
+    features = data['features']
+    labels = data['labels']
+
+    # Get docs_per_query if available
+    docs_per_query = None
+    if 'docs_per_query' in data:
+        docs_per_query = data['docs_per_query']
+
+    return features, labels, docs_per_query
 
 
 def load_head_weights(weight_file, num_heads_per_layer=32, num_layers=32):
@@ -157,15 +181,13 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
         features: (num_docs, num_heads) attention features
         labels: (num_docs,) binary relevance labels
         weights: (num_heads,) head weights
-        docs_per_query: number of documents per query
+        docs_per_query: number of documents per query (int) or array of docs per query
         top_k_heads: if set, only use top-k heads
         ks: list of k values for @k metrics
 
     Returns:
         metrics: dict of metric name -> value
     """
-    num_queries = len(labels) // docs_per_query
-
     # Compute scores
     scores = compute_scores(features, weights, top_k=top_k_heads)
 
@@ -175,24 +197,49 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
     all_ap = []
     all_rr = []
 
-    for q in range(num_queries):
-        start = q * docs_per_query
-        end = start + docs_per_query
+    # Handle variable or fixed docs_per_query
+    if isinstance(docs_per_query, (list, np.ndarray)):
+        # Variable docs per query
+        num_queries = len(docs_per_query)
+        doc_offset = 0
+        for q in range(num_queries):
+            n_docs = docs_per_query[q]
+            q_scores = scores[doc_offset:doc_offset + n_docs]
+            q_labels = labels[doc_offset:doc_offset + n_docs]
+            doc_offset += n_docs
 
-        q_scores = scores[start:end]
-        q_labels = labels[start:end]
+            # Rank by score (descending)
+            ranking = np.argsort(-q_scores)
+            ranked_labels = q_labels[ranking]
 
-        # Rank by score (descending)
-        ranking = np.argsort(-q_scores)
-        ranked_labels = q_labels[ranking]
+            # Compute metrics
+            for k in ks:
+                all_ndcg[k].append(ndcg_at_k(ranked_labels, k))
+                all_precision[k].append(precision_at_k(ranked_labels, k))
 
-        # Compute metrics
-        for k in ks:
-            all_ndcg[k].append(ndcg_at_k(ranked_labels, k))
-            all_precision[k].append(precision_at_k(ranked_labels, k))
+            all_ap.append(average_precision(ranked_labels))
+            all_rr.append(reciprocal_rank(ranked_labels))
+    else:
+        # Fixed docs per query
+        num_queries = len(labels) // docs_per_query
+        for q in range(num_queries):
+            start = q * docs_per_query
+            end = start + docs_per_query
 
-        all_ap.append(average_precision(ranked_labels))
-        all_rr.append(reciprocal_rank(ranked_labels))
+            q_scores = scores[start:end]
+            q_labels = labels[start:end]
+
+            # Rank by score (descending)
+            ranking = np.argsort(-q_scores)
+            ranked_labels = q_labels[ranking]
+
+            # Compute metrics
+            for k in ks:
+                all_ndcg[k].append(ndcg_at_k(ranked_labels, k))
+                all_precision[k].append(precision_at_k(ranked_labels, k))
+
+            all_ap.append(average_precision(ranked_labels))
+            all_rr.append(reciprocal_rank(ranked_labels))
 
     # Aggregate
     metrics = {}
@@ -211,12 +258,14 @@ def main():
                         choices=['mistral', 'llama', 'phi', 'granite'])
     parser.add_argument('--weight_file', type=str, required=True,
                         help='Path to head weights file (BCE JSON or CoRe JSON)')
+    parser.add_argument('--feature_file', '-f', type=str, default=None,
+                        help='Path to feature file (.npz). Default: head_data/{llm}/attention_features_n{num_samples}.npz')
     parser.add_argument('--num_samples', type=int, default=1000,
-                        help='Number of samples in feature file')
+                        help='Number of samples in feature file (used for default path)')
     parser.add_argument('--top_k_heads', type=int, nargs='+', default=None,
                         help='Evaluate with only top-k heads (can specify multiple)')
-    parser.add_argument('--docs_per_query', type=int, default=50,
-                        help='Number of documents per query in the data')
+    parser.add_argument('--docs_per_query', type=int, default=None,
+                        help='Number of documents per query (auto-detected from npz if available)')
     parser.add_argument('--ks', type=int, nargs='+', default=[1, 5, 10],
                         help='k values for @k metrics')
     parser.add_argument('--compare_equal', action='store_true',
@@ -237,13 +286,40 @@ def main():
     print("=" * 70)
 
     # Load features
-    print(f"\nLoading features (n={args.num_samples})...")
-    X, y = load_features(args.llm, args.num_samples)
-    num_queries = len(y) // args.docs_per_query
-    print(f"Features shape: {X.shape}")
-    print(f"Number of queries: {num_queries}")
-    print(f"Docs per query: {args.docs_per_query}")
-    print(f"Positive docs: {y.sum()} ({100*y.mean():.1f}%)")
+    if args.feature_file:
+        print(f"\nLoading features from {args.feature_file}...")
+    else:
+        print(f"\nLoading features (n={args.num_samples})...")
+
+    X, y, docs_per_query_arr = load_features(
+        feature_file=args.feature_file,
+        llm_name=args.llm,
+        num_samples=args.num_samples
+    )
+
+    # Determine docs_per_query
+    if docs_per_query_arr is not None:
+        # Variable docs per query - use the array
+        docs_per_query = docs_per_query_arr
+        num_queries = len(docs_per_query)
+        print(f"Features shape: {X.shape}")
+        print(f"Number of queries: {num_queries}")
+        print(f"Docs per query: variable (min={min(docs_per_query)}, max={max(docs_per_query)}, avg={np.mean(docs_per_query):.1f})")
+    elif args.docs_per_query is not None:
+        docs_per_query = args.docs_per_query
+        num_queries = len(y) // docs_per_query
+        print(f"Features shape: {X.shape}")
+        print(f"Number of queries: {num_queries}")
+        print(f"Docs per query: {docs_per_query}")
+    else:
+        # Default to 50
+        docs_per_query = 50
+        num_queries = len(y) // docs_per_query
+        print(f"Features shape: {X.shape}")
+        print(f"Number of queries: {num_queries}")
+        print(f"Docs per query: {docs_per_query} (default)")
+
+    print(f"Positive docs: {(y == 1).sum()} ({100*(y == 1).mean():.1f}%)")
 
     # Load weights
     print(f"\nLoading weights...")
@@ -270,7 +346,7 @@ def main():
 
         metrics = evaluate_ranking(
             X, y, weights,
-            docs_per_query=args.docs_per_query,
+            docs_per_query=docs_per_query,
             top_k_heads=top_k,
             ks=args.ks
         )
@@ -290,7 +366,7 @@ def main():
 
             eq_metrics = evaluate_ranking(
                 X, y, equal_weights,
-                docs_per_query=args.docs_per_query,
+                docs_per_query=docs_per_query,
                 top_k_heads=None,  # Already masked
                 ks=args.ks
             )
