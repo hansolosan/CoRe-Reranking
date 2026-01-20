@@ -6,14 +6,36 @@ This implements the logistic regression optimization proposed in the report.
 
 import json
 import argparse
+import sys
+import os
 import numpy as np
 from pathlib import Path
+from datetime import datetime
+from joblib import Parallel, delayed
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore')
+
+
+def get_unique_filepath(base_path):
+    """Return a unique filepath by adding numeric suffix if file exists."""
+    path = Path(base_path)
+    if not path.exists():
+        return path
+
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+
+    counter = 1
+    while True:
+        new_path = parent / f"{stem}_{counter}{suffix}"
+        if not new_path.exists():
+            return new_path
+        counter += 1
 
 
 def load_features(llm_name, num_samples):
@@ -42,7 +64,7 @@ def get_head_info(llm_name):
     return model_configs.get(llm_name, (32, 32))
 
 
-def train_logistic_regression(X_train, y_train, X_val, y_val, lambda_l1=0.01):
+def train_logistic_regression(X_train, y_train, X_val, y_val, lambda_l1=0.01, max_iter=1000):
     """
     Train L1-regularized logistic regression.
 
@@ -50,6 +72,7 @@ def train_logistic_regression(X_train, y_train, X_val, y_val, lambda_l1=0.01):
         X_train, y_train: Training data
         X_val, y_val: Validation data
         lambda_l1: L1 regularization strength (C = 1/lambda_l1)
+        max_iter: Maximum iterations for solver
 
     Returns:
         model: Trained model
@@ -62,7 +85,7 @@ def train_logistic_regression(X_train, y_train, X_val, y_val, lambda_l1=0.01):
         penalty='l1',
         C=C,
         solver='saga',
-        max_iter=1000,
+        max_iter=max_iter,
         random_state=42,
         class_weight='balanced'  # Handle class imbalance (1 pos vs 49 neg)
     )
@@ -145,6 +168,64 @@ def compare_with_core_heads(learned_heads, llm_name, temp=0.001, prune=0.0):
     return core_top8, learned_top8
 
 
+def convert_to_native(obj):
+    """Convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_to_native(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_native(v) for v in obj]
+    return obj
+
+
+def save_results(output_dir, lambda_l1, num_samples, metrics, top_heads, all_heads, command):
+    """Save results for a single lambda value."""
+    base_file = output_dir / f'bce_weights_lambda{lambda_l1}_n{num_samples}.json'
+    output_file = get_unique_filepath(base_file)
+
+    results = {
+        'command': command,
+        'timestamp': datetime.now().isoformat(),
+        'lambda_l1': float(lambda_l1),
+        'num_samples': int(num_samples),
+        'metrics': convert_to_native(metrics),
+        'top_heads': [{'layer': int(h['layer']), 'head': int(h['head']), 'weight': float(h['weight'])}
+                      for h in top_heads],
+        'all_weights': {f"{h['layer']}-{h['head']}": float(h['weight']) for h in all_heads}
+    }
+
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+
+    return output_file
+
+
+def train_single_lambda(lambda_l1, X_train, y_train, X_val, y_val, num_layers, num_heads, max_iter=1000):
+    """
+    Train a single model for one lambda value. Designed for parallel execution.
+
+    Returns:
+        dict with lambda_l1, metrics, top_heads, all_heads
+    """
+    model, metrics = train_logistic_regression(
+        X_train, y_train, X_val, y_val, lambda_l1, max_iter=max_iter
+    )
+    top_heads, all_heads = analyze_weights(model, num_layers, num_heads, top_k=20)
+
+    return {
+        'lambda_l1': lambda_l1,
+        'model': model,
+        'metrics': metrics,
+        'top_heads': top_heads,
+        'all_heads': all_heads
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train head weights with BCE + L1')
     parser.add_argument('--llm', type=str, default='mistral',
@@ -158,7 +239,16 @@ def main():
                         help='Validation split ratio')
     parser.add_argument('--temp', type=float, default=0.001,
                         help='Temperature used for CoRe head detection (for comparison)')
+    parser.add_argument('--save_all', action='store_true',
+                        help='Save results for all lambda values (default: only best)')
+    parser.add_argument('--n_jobs', type=int, default=1,
+                        help='Number of parallel jobs (-1 for all CPUs, default: 1)')
+    parser.add_argument('--max_iter', type=int, default=1000,
+                        help='Maximum iterations for SAGA solver (default: 1000)')
     args = parser.parse_args()
+
+    # Capture the command used to run this script
+    command = ' '.join(sys.argv)
 
     print(f"Training head weights for {args.llm}")
     print(f"L1 regularization values: {args.lambda_l1}")
@@ -191,38 +281,81 @@ def main():
     X_val_scaled = scaler.transform(X_val)
 
     # Train with different regularization strengths
+    output_dir = Path(__file__).parent.parent / 'head_data' / args.llm
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    n_jobs = args.n_jobs if args.n_jobs != 0 else 1
+    if n_jobs == -1:
+        n_jobs = os.cpu_count() or 1
+
     print(f"\n{'='*60}")
-    print("Training Results")
+    print(f"Training Results (n_jobs={n_jobs}, max_iter={args.max_iter})")
     print('='*60)
-    print(f"{'Lambda':<10} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1':<10} {'AUC-ROC':<10} {'Non-zero':<10} {'Sparsity':<10}")
-    print('-'*90)
 
-    best_model = None
-    best_auc = 0
-    best_lambda = None
-
-    for lambda_l1 in args.lambda_l1:
-        model, metrics = train_logistic_regression(
-            X_train_scaled, y_train, X_val_scaled, y_val, lambda_l1
+    if n_jobs > 1 and len(args.lambda_l1) > 1:
+        # Parallel training
+        print(f"Training {len(args.lambda_l1)} models in parallel...")
+        all_results = Parallel(n_jobs=n_jobs, verbose=10)(
+            delayed(train_single_lambda)(
+                lambda_l1, X_train_scaled, y_train, X_val_scaled, y_val,
+                num_layers, num_heads, args.max_iter
+            )
+            for lambda_l1 in args.lambda_l1
         )
+        # Sort by lambda for consistent ordering
+        all_results.sort(key=lambda x: x['lambda_l1'])
 
-        print(f"{lambda_l1:<10.4f} {metrics['accuracy']:<10.4f} {metrics['precision']:<10.4f} "
-              f"{metrics['recall']:<10.4f} {metrics['f1']:<10.4f} {metrics['auc_roc']:<10.4f} "
-              f"{metrics['num_nonzero_weights']:<10d} {metrics['sparsity']:<10.4f}")
+        # Print results table after parallel completion
+        print(f"\n{'Lambda':<10} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1':<10} {'AUC-ROC':<10} {'Non-zero':<10} {'Sparsity':<10}")
+        print('-'*90)
+        for result in all_results:
+            metrics = result['metrics']
+            print(f"{result['lambda_l1']:<10.4f} {metrics['accuracy']:<10.4f} {metrics['precision']:<10.4f} "
+                  f"{metrics['recall']:<10.4f} {metrics['f1']:<10.4f} {metrics['auc_roc']:<10.4f} "
+                  f"{metrics['num_nonzero_weights']:<10d} {metrics['sparsity']:<10.4f}")
+    else:
+        # Sequential training (original behavior)
+        print(f"{'Lambda':<10} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1':<10} {'AUC-ROC':<10} {'Non-zero':<10} {'Sparsity':<10}")
+        print('-'*90)
+        all_results = []
+        for lambda_l1 in args.lambda_l1:
+            result = train_single_lambda(
+                lambda_l1, X_train_scaled, y_train, X_val_scaled, y_val,
+                num_layers, num_heads, args.max_iter
+            )
+            all_results.append(result)
 
-        if metrics['auc_roc'] > best_auc:
-            best_auc = metrics['auc_roc']
-            best_model = model
-            best_lambda = lambda_l1
+            # Print immediately in sequential mode
+            metrics = result['metrics']
+            print(f"{lambda_l1:<10.4f} {metrics['accuracy']:<10.4f} {metrics['precision']:<10.4f} "
+                  f"{metrics['recall']:<10.4f} {metrics['f1']:<10.4f} {metrics['auc_roc']:<10.4f} "
+                  f"{metrics['num_nonzero_weights']:<10d} {metrics['sparsity']:<10.4f}", flush=True)
+
+    # Find best model and save results
+    best_result = max(all_results, key=lambda x: x['metrics']['auc_roc'])
+    best_lambda = best_result['lambda_l1']
+    best_auc = best_result['metrics']['auc_roc']
+
+    # Save results
+    for result in all_results:
+        if args.save_all or result['lambda_l1'] == best_lambda:
+            output_file = save_results(output_dir, result['lambda_l1'], args.num_samples,
+                                       result['metrics'], result['top_heads'],
+                                       result['all_heads'], command)
+            if args.save_all:
+                print(f"  Saved lambda={result['lambda_l1']} to {output_file}")
 
     print(f"\nBest model: lambda={best_lambda}, AUC-ROC={best_auc:.4f}")
+
+    # Get best model results from stored data
+    best_result = next(r for r in all_results if r['lambda_l1'] == best_lambda)
+    top_heads = best_result['top_heads']
+    all_heads = best_result['all_heads']
 
     # Analyze best model weights
     print(f"\n{'='*60}")
     print(f"Top 20 Heads by Learned Weight (lambda={best_lambda})")
     print('='*60)
-
-    top_heads, all_heads = analyze_weights(best_model, num_layers, num_heads, top_k=20)
 
     print(f"{'Rank':<6} {'Layer':<8} {'Head':<8} {'Weight':<12}")
     print('-'*40)
@@ -232,24 +365,10 @@ def main():
     # Compare with CoRe heads
     compare_with_core_heads(top_heads, args.llm, temp=args.temp)
 
-    # Save results
-    output_dir = Path(__file__).parent.parent / 'head_data' / args.llm
-    output_file = output_dir / f'bce_weights_lambda{best_lambda}_n{args.num_samples}.json'
-
-    results = {
-        'lambda_l1': best_lambda,
-        'num_samples': args.num_samples,
-        'metrics': {
-            'auc_roc': best_auc,
-        },
-        'top_heads': [{'layer': h['layer'], 'head': h['head'], 'weight': float(h['weight'])}
-                      for h in top_heads],
-        'all_weights': {f"{h['layer']}-{h['head']}": float(h['weight']) for h in all_heads}
-    }
-
-    with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"\nSaved results to {output_file}")
+    if not args.save_all:
+        print(f"\nSaved best model to {output_dir}/")
+    else:
+        print(f"\nAll {len(args.lambda_l1)} models saved to {output_dir}/")
 
 
 if __name__ == '__main__':

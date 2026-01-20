@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Extract attention features from all heads for BCE optimization.
-This script runs the model on head detection data and saves per-head attention scores.
+Extract attention features from all heads for BCE optimization or evaluation.
+This script runs the model on detection data or retriever output and saves per-head attention scores.
+
+Supports two input formats:
+1. Head detection data (nq_core.json): has 'question', 'paragraphs' with 'is_positive'/'is_negative'
+2. Retriever output (retriever_output/*.json): has 'idx', 'question', 'paragraphs' with 'idx', 'paragraph_text'
 """
 
 import json
@@ -18,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "experiments"))
 
 from src.custom.custom_cache import DynamicCacheWithQuery
 import transformers
+from transformers import BitsAndBytesConfig
 
 LLM_NAMES = {
     'granite': 'ibm-granite/granite-3.2-8b-instruct',
@@ -26,10 +31,23 @@ LLM_NAMES = {
     'mistral': 'mistralai/Mistral-7B-Instruct-v0.2'
 }
 
+
 class FeatureExtractor:
     """Extract attention features from all heads for optimization."""
 
-    def __init__(self, llm_name, prune=0.0):
+    def __init__(self, llm_name, prune=0.0, quantize=None):
+        """
+        Initialize the feature extractor.
+
+        Args:
+            llm_name: HuggingFace model name
+            prune: Layer pruning ratio (0.0 = no pruning)
+            quantize: Quantization mode - None, '4bit', or '8bit'
+        """
+        print(f"Loading model: {llm_name}...", flush=True)
+        if quantize:
+            print(f"Using {quantize} quantization", flush=True)
+
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(llm_name)
         config = transformers.AutoConfig.from_pretrained(llm_name)
         config.num_hidden_layers = int(config.num_hidden_layers * (1 - prune))
@@ -53,13 +71,42 @@ class FeatureExtractor:
         else:
             raise ValueError(f'Model {llm_name} not supported')
 
-        self.llm = BaseLLMClass.from_pretrained(
-            llm_name,
-            config=config,
-            torch_dtype=torch.float16,
-            attn_implementation='flash_attention_2',
-            device_map='cuda'
-        )
+        # Setup quantization config
+        quantization_config = None
+
+        if quantize == '4bit':
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True
+            )
+        elif quantize == '8bit':
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True
+            )
+
+        # Load model - keep flash_attention_2 for memory efficiency
+        load_kwargs = {
+            'config': config,
+            'device_map': 'cuda',
+            'attn_implementation': 'flash_attention_2'
+        }
+
+        if quantization_config is not None:
+            load_kwargs['quantization_config'] = quantization_config
+        else:
+            load_kwargs['torch_dtype'] = torch.float16
+
+        try:
+            self.llm = BaseLLMClass.from_pretrained(llm_name, **load_kwargs)
+        except Exception as e:
+            # Fall back to eager attention if flash attention fails with quantization
+            print(f"Flash attention failed ({e}), falling back to eager attention", flush=True)
+            load_kwargs['attn_implementation'] = 'eager'
+            self.llm = BaseLLMClass.from_pretrained(llm_name, **load_kwargs)
+
+        self.quantize = quantize
 
         # Setup prompts based on model
         self.offset = 0
@@ -82,16 +129,29 @@ class FeatureExtractor:
 
         self.num_layer = self.llm.config.num_hidden_layers
         self.num_head = self.llm.config.num_attention_heads
+        print(f"Model loaded: {self.num_layer} layers, {self.num_head} heads", flush=True)
 
-    def extract_features(self, query, documents):
+    def extract_features(self, query, documents, max_doc_tokens=300):
         """
         Extract attention features for each document from all heads.
 
+        Args:
+            query: query text
+            documents: list of document dicts with 'paragraph_text'
+            max_doc_tokens: maximum tokens per document (truncate longer docs)
+
         Returns:
             features: np.array of shape (num_docs, num_layers * num_heads)
-            labels: np.array of shape (num_docs,) with 1 for positive, 0 for negative
         """
-        prompt, doc_spans, query_span = self.prepare_input(query, documents)
+        # Truncate documents
+        truncated_docs = []
+        for doc in documents:
+            text = doc.get('paragraph_text', '')
+            # Simple word-based truncation
+            words = text.split()[:max_doc_tokens]
+            truncated_docs.append({'paragraph_text': ' '.join(words)})
+
+        prompt, doc_spans, query_span = self.prepare_input(query, truncated_docs)
 
         # Get attention weights
         tokenized_input = self.tokenizer(prompt, return_tensors='pt').to(self.llm.device)
@@ -205,61 +265,287 @@ class FeatureExtractor:
         return causal_mask
 
 
+def detect_input_format(data):
+    """Detect whether input is head detection format or retriever output format."""
+    if len(data) == 0:
+        return 'unknown'
+
+    sample = data[0]
+
+    # Head detection format has 'is_positive' in paragraphs
+    if 'paragraphs' in sample and len(sample['paragraphs']) > 0:
+        if 'is_positive' in sample['paragraphs'][0]:
+            return 'head_detection'
+
+    # Retriever output has 'idx' at top level
+    if 'idx' in sample:
+        return 'retriever_output'
+
+    return 'unknown'
+
+
+def load_qrels(qrels_file):
+    """
+    Load TREC-format qrels file.
+
+    Supports formats:
+    - 3 columns: query-id, corpus-id, score
+    - 4 columns: query-id, iteration, corpus-id, score (TREC standard)
+
+    Args:
+        qrels_file: Path to qrels file
+
+    Returns:
+        dict: {(query_id, doc_id): relevance_score}
+    """
+    qrels = {}
+    with open(qrels_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            parts = line.split()
+            if len(parts) == 3:
+                # Format: query-id, corpus-id, score
+                query_id, doc_id, score = parts
+            elif len(parts) >= 4:
+                # Format: query-id, iteration, corpus-id, score (TREC standard)
+                query_id, _, doc_id, score = parts[:4]
+            else:
+                continue
+
+            try:
+                score = int(score)
+            except ValueError:
+                try:
+                    score = float(score)
+                except ValueError:
+                    continue
+
+            qrels[(query_id, doc_id)] = score
+
+    return qrels
+
+
+def get_label_from_qrels(query_id, doc_id, qrels, relevance_threshold=1):
+    """
+    Get label for a (query, doc) pair from qrels.
+
+    Args:
+        query_id: Query identifier
+        doc_id: Document identifier
+        qrels: Dict from load_qrels()
+        relevance_threshold: Minimum score to be considered positive (default: 1)
+
+    Returns:
+        1 if positive (in qrels with score >= threshold), 0 otherwise (negative or not in qrels)
+    """
+    key = (str(query_id), str(doc_id))
+    if key in qrels:
+        return 1 if qrels[key] >= relevance_threshold else 0
+    return 0  # Not in qrels - treat as negative
+
+
 def main():
     parser = argparse.ArgumentParser(description='Extract head attention features')
     parser.add_argument('--llm', type=str, default='mistral',
                         choices=['mistral', 'llama', 'phi', 'granite'])
-    parser.add_argument('--max_samples', type=int, default=1000,
-                        help='Maximum number of samples to process')
-    parser.add_argument('--prune', type=float, default=0.0)
+    parser.add_argument('--input_file', type=str, default=None,
+                        help='Input JSON file (default: head_data/nq_core.json)')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Output directory (default: head_data/{llm}/)')
+    parser.add_argument('--output_name', '-o', type=str, default=None,
+                        help='Output filename (without extension). Default: attention_features_{input}_{n}_{quantize}')
+    parser.add_argument('--max_samples', type=int, default=None,
+                        help='Maximum number of samples to process (default: all)')
+    parser.add_argument('--max_docs', type=int, default=None,
+                        help='Maximum documents per query (default: all)')
+    parser.add_argument('--max_doc_tokens', type=int, default=300,
+                        help='Maximum tokens per document (default: 300)')
+    parser.add_argument('--prune', type=float, default=0.0,
+                        help='Layer pruning ratio (default: 0.0)')
+    parser.add_argument('--qrels', type=str, default=None,
+                        help='TREC qrels file for relevance labels (format: query-id doc-id score)')
+    parser.add_argument('--relevance_threshold', type=int, default=1,
+                        help='Minimum qrels score to be considered positive (default: 1)')
+    parser.add_argument('--quantize', type=str, default=None, choices=[None, '4bit', '8bit'],
+                        help='Quantization mode: 4bit, 8bit, or None (default: None)')
     args = parser.parse_args()
 
-    # Load head detection data
-    data_file = Path(__file__).parent.parent / 'head_data' / 'nq_core.json'
-    with open(data_file, 'r') as f:
+    # Determine input file
+    if args.input_file is None:
+        input_file = Path(__file__).parent.parent / 'head_data' / 'nq_core.json'
+    else:
+        input_file = Path(args.input_file)
+
+    if not input_file.exists():
+        print(f"Error: Input file not found: {input_file}")
+        return
+
+    # Load data
+    print(f"Loading data from {input_file}...", flush=True)
+    with open(input_file, 'r') as f:
         data = json.load(f)
 
-    print(f"Loaded {len(data)} samples from {data_file}")
+    print(f"Loaded {len(data)} samples", flush=True)
+
+    # Detect format
+    input_format = detect_input_format(data)
+    print(f"Detected format: {input_format}", flush=True)
+
+    # Load qrels if provided
+    qrels = None
+    if args.qrels is not None:
+        qrels_path = Path(args.qrels)
+        if qrels_path.exists():
+            qrels = load_qrels(qrels_path)
+            print(f"Loaded {len(qrels)} qrels from {qrels_path}", flush=True)
+        else:
+            print(f"Warning: qrels file not found: {qrels_path}", flush=True)
 
     # Limit samples
-    data = data[:args.max_samples]
-    print(f"Processing {len(data)} samples")
+    if args.max_samples is not None:
+        data = data[:args.max_samples]
+        print(f"Limited to {len(data)} samples", flush=True)
 
     # Initialize extractor
-    print(f"Loading model: {LLM_NAMES[args.llm]}")
-    extractor = FeatureExtractor(LLM_NAMES[args.llm], prune=args.prune)
-    print(f"Model has {extractor.num_layer} layers, {extractor.num_head} heads")
-    print(f"Total features per document: {extractor.num_layer * extractor.num_head}")
+    extractor = FeatureExtractor(LLM_NAMES[args.llm], prune=args.prune, quantize=args.quantize)
+    print(f"Total features per document: {extractor.num_layer * extractor.num_head}", flush=True)
 
     # Extract features
     all_features = []
     all_labels = []
+    all_query_ids = []
+    all_doc_ids = []
+    docs_per_query = []
 
     for sample in tqdm(data, desc="Extracting features"):
-        query = sample['question']
-        documents = sample['paragraphs']
+        # Get query
+        query = sample.get('question', sample.get('query', ''))
+        query_id = sample.get('idx', '')
 
-        features = extractor.extract_features(query, documents)
-        labels = np.array([1 if d['is_positive'] else 0 for d in documents], dtype=np.int32)
+        # Get documents
+        documents = sample.get('paragraphs', [])
+
+        # Limit documents per query
+        if args.max_docs is not None:
+            documents = documents[:args.max_docs]
+
+        if len(documents) == 0:
+            continue
+
+        # Extract features
+        try:
+            features = extractor.extract_features(query, documents, max_doc_tokens=args.max_doc_tokens)
+        except torch.cuda.OutOfMemoryError:
+            print(f"Warning: OOM for query {query_id} with {len(documents)} docs, skipping", flush=True)
+            torch.cuda.empty_cache()
+            continue
+        except Exception as e:
+            print(f"Warning: Failed to extract features for query {query_id}: {e}", flush=True)
+            torch.cuda.empty_cache()
+            continue
+
+        # Get document IDs
+        doc_ids = [d.get('idx', f'doc_{i}') for i, d in enumerate(documents)]
+
+        # Get labels
+        if input_format == 'head_detection':
+            # Use is_positive field from head detection data
+            labels = np.array([1 if d.get('is_positive', False) else 0 for d in documents], dtype=np.int32)
+        elif qrels is not None:
+            # Use qrels file for labels
+            labels = np.array([
+                get_label_from_qrels(query_id, doc_id, qrels, args.relevance_threshold)
+                for doc_id in doc_ids
+            ], dtype=np.int32)
+        else:
+            # No labels available
+            labels = np.full(len(documents), -1, dtype=np.int32)
 
         all_features.append(features)
         all_labels.append(labels)
+        all_query_ids.extend([query_id] * len(documents))
+        all_doc_ids.extend(doc_ids)
+        docs_per_query.append(len(documents))
 
     # Stack all features
     all_features = np.vstack(all_features)
     all_labels = np.concatenate(all_labels)
 
-    print(f"\nExtracted features shape: {all_features.shape}")
-    print(f"Labels shape: {all_labels.shape}")
-    print(f"Positive samples: {all_labels.sum()}, Negative samples: {(1 - all_labels).sum()}")
+    print(f"\nExtracted features shape: {all_features.shape}", flush=True)
+    print(f"Labels shape: {all_labels.shape}", flush=True)
 
-    # Save features
-    output_dir = Path(__file__).parent.parent / 'head_data' / args.llm
+    # Print label statistics
+    n_positive = int((all_labels == 1).sum())
+    n_negative = int((all_labels == 0).sum())
+    n_unknown = int((all_labels == -1).sum())
+    if n_positive > 0 or n_negative > 0:
+        print(f"Positive samples: {n_positive}, Negative samples: {n_negative}", flush=True)
+    else:
+        print(f"No labels available (all {n_unknown} samples unlabeled)", flush=True)
+
+    print(f"Queries processed: {len(docs_per_query)}", flush=True)
+    print(f"Docs per query: min={min(docs_per_query)}, max={max(docs_per_query)}, avg={np.mean(docs_per_query):.1f}", flush=True)
+
+    # Determine output path
+    if args.output_dir is not None:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = Path(__file__).parent.parent / 'head_data' / args.llm
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_file = output_dir / f'attention_features_n{args.max_samples}.npz'
-    np.savez(output_file, features=all_features, labels=all_labels)
-    print(f"\nSaved features to {output_file}")
+    # Determine output name
+    if args.output_name is not None:
+        output_name = args.output_name
+    else:
+        # Derive from input file name
+        input_stem = input_file.stem  # e.g., 'nq_core' or 'nq'
+        n_samples = len(docs_per_query)
+        quant_suffix = f'_{args.quantize}' if args.quantize else ''
+        output_name = f'attention_features_{input_stem}_n{n_samples}{quant_suffix}'
+
+    # Save features
+    output_file = output_dir / f'{output_name}.npz'
+    np.savez(
+        output_file,
+        features=all_features,
+        labels=all_labels,
+        query_ids=np.array(all_query_ids, dtype=object),
+        doc_ids=np.array(all_doc_ids, dtype=object),
+        docs_per_query=np.array(docs_per_query, dtype=np.int32)
+    )
+    print(f"\nSaved features to {output_file}", flush=True)
+
+    # Save metadata
+    metadata_file = output_dir / f'{output_name}.meta.json'
+    has_labels = bool(n_positive > 0 or n_negative > 0)
+    metadata = {
+        'input_file': str(input_file),
+        'input_format': input_format,
+        'llm': args.llm,
+        'num_queries': len(docs_per_query),
+        'num_documents': len(all_labels),
+        'num_features': all_features.shape[1],
+        'num_layers': extractor.num_layer,
+        'num_heads': extractor.num_head,
+        'max_doc_tokens': args.max_doc_tokens,
+        'prune': args.prune,
+        'quantize': args.quantize,
+        'has_labels': has_labels,
+        'qrels_file': str(args.qrels) if args.qrels else None,
+        'relevance_threshold': args.relevance_threshold if args.qrels else None,
+        'label_stats': {
+            'positive': int(n_positive),
+            'negative': int(n_negative),
+            'unknown': int(n_unknown)
+        }
+    }
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Saved metadata to {metadata_file}", flush=True)
 
 
 if __name__ == '__main__':
