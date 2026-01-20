@@ -53,6 +53,13 @@ class FeatureExtractor:
             print(f"Using {quantize} quantization", flush=True)
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(llm_name)
+
+        # Set padding token if not already set (required for batched inference)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        # Use left padding for causal LMs (so generation happens on the right)
+        self.tokenizer.padding_side = 'left'
         config = transformers.AutoConfig.from_pretrained(llm_name)
         config.num_hidden_layers = int(config.num_hidden_layers * (1 - prune))
 
