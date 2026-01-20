@@ -267,7 +267,7 @@ class FeatureExtractor:
         return causal_mask
 
 
-def open_file(filepath, mode='r'):
+def open_file(filepath, mode='r', encoding='utf-8'):
     """
     Open a file, automatically handling compression based on extension.
 
@@ -279,6 +279,7 @@ def open_file(filepath, mode='r'):
     Args:
         filepath: Path to the file
         mode: File mode ('r' for text, 'rb' for binary)
+        encoding: Text encoding (default: utf-8)
 
     Returns:
         File handle
@@ -287,11 +288,17 @@ def open_file(filepath, mode='r'):
     suffix = filepath.suffix.lower()
 
     if suffix == '.gz':
-        return gzip.open(filepath, mode + 't' if 'b' not in mode else mode)
+        if 'b' in mode:
+            return gzip.open(filepath, mode)
+        return gzip.open(filepath, mode + 't', encoding=encoding)
     elif suffix == '.bz2':
-        return bz2.open(filepath, mode + 't' if 'b' not in mode else mode)
+        if 'b' in mode:
+            return bz2.open(filepath, mode)
+        return bz2.open(filepath, mode + 't', encoding=encoding)
     else:
-        return open(filepath, mode)
+        if 'b' in mode:
+            return open(filepath, mode)
+        return open(filepath, mode, encoding=encoding)
 
 
 def detect_input_format(data):
