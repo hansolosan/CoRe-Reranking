@@ -53,6 +53,7 @@ Comprehensive feature extraction with multiple input/output options:
 - ✅ Quantization mode in output filename
 - ✅ Metadata JSON file with configuration details
 - ✅ OOM error handling with automatic skip and cache clearing
+- ✅ Compressed input file support (`.gz`, `.bz2`)
 
 **Supported input formats:**
 1. Head detection data (`nq_core.json`): has `is_positive`/`is_negative` fields
@@ -186,6 +187,12 @@ CUDA_VISIBLE_DEVICES=0 python scripts/extract_head_features.py \
     --llm mistral \
     --input_file retriever_output/nq.json \
     --qrels path/to/qrels.tsv \
+    --max_samples 100
+
+# From compressed input file (.gz or .bz2)
+CUDA_VISIBLE_DEVICES=0 python scripts/extract_head_features.py \
+    --llm mistral \
+    --input_file retriever_output/nq.json.gz \
     --max_samples 100
 
 # With 4-bit quantization (reduces memory ~4x)

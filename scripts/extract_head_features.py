@@ -11,6 +11,8 @@ Supports two input formats:
 import json
 import os
 import argparse
+import gzip
+import bz2
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -265,6 +267,33 @@ class FeatureExtractor:
         return causal_mask
 
 
+def open_file(filepath, mode='r'):
+    """
+    Open a file, automatically handling compression based on extension.
+
+    Supports:
+        - .gz (gzip compression)
+        - .bz2 (bzip2 compression)
+        - uncompressed files
+
+    Args:
+        filepath: Path to the file
+        mode: File mode ('r' for text, 'rb' for binary)
+
+    Returns:
+        File handle
+    """
+    filepath = Path(filepath)
+    suffix = filepath.suffix.lower()
+
+    if suffix == '.gz':
+        return gzip.open(filepath, mode + 't' if 'b' not in mode else mode)
+    elif suffix == '.bz2':
+        return bz2.open(filepath, mode + 't' if 'b' not in mode else mode)
+    else:
+        return open(filepath, mode)
+
+
 def detect_input_format(data):
     """Detect whether input is head detection format or retriever output format."""
     if len(data) == 0:
@@ -352,7 +381,7 @@ def main():
     parser.add_argument('--llm', type=str, default='mistral',
                         choices=['mistral', 'llama', 'phi', 'granite'])
     parser.add_argument('--input_file', type=str, default=None,
-                        help='Input JSON file (default: head_data/nq_core.json)')
+                        help='Input JSON file (default: head_data/nq_core.json). Supports .gz and .bz2 compression.')
     parser.add_argument('--output_dir', type=str, default=None,
                         help='Output directory (default: head_data/{llm}/)')
     parser.add_argument('--output_name', '-o', type=str, default=None,
@@ -383,9 +412,9 @@ def main():
         print(f"Error: Input file not found: {input_file}")
         return
 
-    # Load data
+    # Load data (supports .gz and .bz2 compressed files)
     print(f"Loading data from {input_file}...", flush=True)
-    with open(input_file, 'r') as f:
+    with open_file(input_file, 'r') as f:
         data = json.load(f)
 
     print(f"Loaded {len(data)} samples", flush=True)
@@ -501,8 +530,11 @@ def main():
     if args.output_name is not None:
         output_name = args.output_name
     else:
-        # Derive from input file name
+        # Derive from input file name (strip compression extensions)
         input_stem = input_file.stem  # e.g., 'nq_core' or 'nq'
+        # Handle double extensions like .json.gz
+        if input_stem.endswith('.json'):
+            input_stem = input_stem[:-5]
         n_samples = len(docs_per_query)
         quant_suffix = f'_{args.quantize}' if args.quantize else ''
         output_name = f'attention_features_{input_stem}_n{n_samples}{quant_suffix}'
