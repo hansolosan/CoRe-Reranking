@@ -67,7 +67,7 @@ Comprehensive feature extraction with multiple input/output options:
 - ✅ Numeric suffix to avoid overwriting files
 - ✅ `--save_all` flag to save all lambda results
 
-### 5. Evaluation Script (`scripts/evaluate_head_weights.py`)
+### 5. Evaluation Script (`scripts/rerank_with_head_weights.py`)
 Computes ranking metrics on head detection data:
 - **NDCG@k** (k=1,5,10)
 - **Precision@k** (k=1,5,10)
@@ -155,7 +155,7 @@ CoRe-Reranking/
 │   ├── analyze_head_data.py         # Data analysis script
 │   ├── extract_head_features.py     # Feature extraction (+ quantization)
 │   ├── train_head_weights_bce.py    # BCE + L1 optimization (parallel)
-│   ├── evaluate_head_weights.py     # Ranking metrics evaluation
+│   ├── rerank_with_head_weights.py  # Ranking metrics evaluation
 │   ├── compare_features.py          # Compare feature files (NEW)
 │   ├── compare_head_selection.py    # Compare methods (AUC-ROC)
 │   ├── analyze_sparsity.py          # Sparsity analysis with plotting
@@ -232,12 +232,12 @@ python scripts/train_head_weights_bce.py --llm mistral \
 
 ```bash
 # Evaluate BCE weights with ranking metrics
-python scripts/evaluate_head_weights.py --llm mistral \
+python scripts/rerank_with_head_weights.py --llm mistral \
     --weight_file head_data/mistral/bce_weights_lambda100.0_n1000.json \
     --top_k_heads 8 16 32 --compare_equal
 
 # Compare with CoRe heads
-python scripts/evaluate_head_weights.py --llm mistral \
+python scripts/rerank_with_head_weights.py --llm mistral \
     --weight_file head_data/mistral/core_temp0.001_prune0.0.json \
     --top_k_heads 8
 ```
