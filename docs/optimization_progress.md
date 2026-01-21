@@ -72,9 +72,14 @@ Comprehensive feature extraction with multiple input/output options:
 - ✅ Configurable max iterations (`--max_iter`)
 - ✅ Command logging in output JSON
 - ✅ Numeric suffix to avoid overwriting files
-- ✅ `--save_all` flag to save all lambda results
+- ✅ Saves all lambda results by default (`--save_best_only` to save only best)
+- ✅ Direct feature file input (`--feature_file` / `-f`)
+- ✅ Query-level train/val split (no data leakage between base queries)
+- ✅ JSON-based query grouping (`--input_file` to load query variations)
 
 **Note on normalization**: The BCE loss is normalized by the number of samples, making λ comparable across different dataset sizes. This was updated from the original unnormalized formulation.
+
+**Note on data splitting**: Train/val split is done at the BASE QUERY level. The NQ data has 5 position variations per base query, and all variations stay together in the same split to prevent data leakage.
 
 ### 5. Evaluation Script (`scripts/rerank_with_head_weights.py`)
 Computes ranking metrics on head detection data:
@@ -84,6 +89,9 @@ Computes ranking metrics on head detection data:
 - **MRR** (Mean Reciprocal Rank)
 - Supports comparison of learned vs equal weights
 - Works with both BCE and CoRe weight files
+- ✅ Multiple feature files (`-f file1.npz file2.npz ...`)
+- ✅ Combined results table for all files
+- ✅ Optional JSON output (`--output` / `-o`)
 
 ### 6. Feature Comparison (`scripts/compare_features.py`) — NEW
 Compares two feature files to measure quantization effects:
@@ -164,11 +172,12 @@ CoRe-Reranking/
 │   ├── head_selection_report.tex    # LaTeX report with equations
 │   └── optimization_progress.md     # This document
 ├── scripts/
+│   ├── utils.py                     # Shared utilities (command logging)
 │   ├── analyze_head_data.py         # Data analysis script
 │   ├── extract_head_features.py     # Feature extraction (+ quantization)
 │   ├── train_head_weights_bce.py    # BCE + L1 optimization (parallel)
-│   ├── rerank_with_head_weights.py  # Ranking metrics evaluation
-│   ├── compare_features.py          # Compare feature files (NEW)
+│   ├── rerank_with_head_weights.py  # Ranking metrics evaluation (multi-file)
+│   ├── compare_features.py          # Compare feature files
 │   ├── compare_head_selection.py    # Compare methods (AUC-ROC)
 │   ├── analyze_sparsity.py          # Sparsity analysis with plotting
 │   └── get_top_heads.py             # Quick head inspection
@@ -240,13 +249,24 @@ python scripts/extract_head_features.py \
 
 ```bash
 # Parallel training with multiple lambda values (normalized loss)
+# All lambda results saved by default
 python scripts/train_head_weights_bce.py --llm mistral \
     --lambda_l1 1e-5 1e-4 1e-3 1e-2 1e-1 \
-    --n_jobs -1 --save_all
+    --n_jobs -1
 
 # Higher lambda for more sparsity
 python scripts/train_head_weights_bce.py --llm mistral \
-    --lambda_l1 0.1 0.5 1.0 2.0 --n_jobs -1 --save_all
+    --lambda_l1 0.1 0.5 1.0 2.0 --n_jobs -1
+
+# Direct feature file input (instead of constructing path from --llm and --num_samples)
+python scripts/train_head_weights_bce.py --llm mistral \
+    -f head_data/mistral/attention_features_custom.npz \
+    --lambda_l1 1e-3 1e-2 1e-1 --n_jobs -1
+
+# With query groupings from original JSON (for proper train/val split)
+python scripts/train_head_weights_bce.py --llm mistral \
+    --input_file head_data/nq_core.json \
+    --lambda_l1 1e-3 1e-2 1e-1 --n_jobs -1
 ```
 
 **Note**: Lambda values are for the normalized loss `(1/n)*sum(BCE) + λ*||w||_1`. Typical range: `1e-5` to `1.0`.
@@ -263,6 +283,18 @@ python scripts/rerank_with_head_weights.py --llm mistral \
 python scripts/rerank_with_head_weights.py --llm mistral \
     --weight_file head_data/mistral/core_temp0.001_prune0.0.json \
     --top_k_heads 8
+
+# Evaluate on multiple feature files (e.g., different k values)
+python scripts/rerank_with_head_weights.py --llm mistral \
+    --weight_file head_data/mistral/core_temp0.001_prune0.5.json \
+    -f head_data/mistral/attention_features_nq_n100_k*.npz \
+    --top_k_heads 8 --ks 1 3 5 10 100
+
+# Save results to JSON file
+python scripts/rerank_with_head_weights.py --llm mistral \
+    --weight_file head_data/mistral/bce_weights_lambda0.01_n1000.json \
+    -f head_data/mistral/features_train.npz head_data/mistral/features_test.npz \
+    --top_k_heads 8 32 -o results/eval_metrics.json
 ```
 
 ### Compare Quantized vs Full Precision

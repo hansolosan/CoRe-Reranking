@@ -1246,6 +1246,8 @@ def main():
         quant_suffix = f'_{args.quantize}' if args.quantize else ''
         output_name = f'attention_features_{input_stem}_n{n_samples}{quant_suffix}'
 
+    if output_name.find(".npz") > 0:
+        output_name = output_name.replace(".npz", "")
     # Save features
     output_file = output_dir / f'{output_name}.npz'
     np.savez(
