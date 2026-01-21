@@ -480,8 +480,11 @@ def main():
     if 'mrr' in args.metrics:
         metric_names.append('MRR')
 
-    # Collect all rows for finding max values
+    # Collect all rows for finding max values, tracking file index
     all_rows = []
+    file_row_ranges = []  # (start_idx, end_idx) for each file
+    row_idx = 0
+
     for file_results in all_file_results:
         if file_results['feature_file']:
             file_label = Path(file_results['feature_file']).stem
@@ -490,6 +493,7 @@ def main():
         else:
             file_label = f"default (n={args.num_samples})"
 
+        start_idx = row_idx
         for i, r in enumerate(file_results['results']):
             label = file_label if i == 0 else ""
             all_rows.append({
@@ -498,15 +502,27 @@ def main():
                 'weights': r['weights'],
                 'metrics': r['metrics']
             })
+            row_idx += 1
+        file_row_ranges.append((start_idx, row_idx))
 
-    # Find max value for each metric (only highlight if multiple rows)
-    max_values = {}
+    # Find global max value for each metric (only highlight if multiple rows)
+    global_max = {}
     if len(all_rows) > 1:
         for name in metric_names:
-            max_values[name] = max(row['metrics'][name] for row in all_rows)
+            global_max[name] = max(row['metrics'][name] for row in all_rows)
+
+    # Find per-file max values (only if multiple files)
+    file_max = [{} for _ in range(len(file_row_ranges))]
+    if len(file_row_ranges) > 1:
+        for file_idx, (start, end) in enumerate(file_row_ranges):
+            file_rows = all_rows[start:end]
+            if len(file_rows) > 1:
+                for name in metric_names:
+                    file_max[file_idx][name] = max(row['metrics'][name] for row in file_rows)
 
     # ANSI color codes
     GREEN = '\033[92m'
+    BLUE = '\033[94m'
     BOLD = '\033[1m'
     RESET = '\033[0m'
 
@@ -518,14 +534,20 @@ def main():
     print("-" * len(header))
 
     # Print rows with highlighting
-    for row in all_rows:
+    for row_idx, row in enumerate(all_rows):
+        # Determine which file this row belongs to
+        file_idx = next(i for i, (start, end) in enumerate(file_row_ranges) if start <= row_idx < end)
+
         line = f"{row['file_label']:<30} {row['config']:<12} {row['weights']:<10}"
         for name in metric_names:
             value = row['metrics'][name]
             formatted = f"{value:<8.4f}"
-            # Highlight max values in green+bold
-            if max_values and value == max_values[name]:
+            # Highlight global max in green+bold
+            if global_max and value == global_max[name]:
                 formatted = f"{GREEN}{BOLD}{value:<8.4f}{RESET}"
+            # Highlight per-file max in blue+bold (if not global max and multiple files)
+            elif file_max[file_idx].get(name) is not None and value == file_max[file_idx][name]:
+                formatted = f"{BLUE}{BOLD}{value:<8.4f}{RESET}"
             line += f" {formatted}"
         print(line)
 
