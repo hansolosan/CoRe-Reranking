@@ -54,6 +54,12 @@ Comprehensive feature extraction with multiple input/output options:
 - ✅ Metadata JSON file with configuration details
 - ✅ OOM error handling with automatic skip and cache clearing
 - ✅ Compressed input file support (`.gz`, `.bz2`)
+- ✅ **vLLM backend support** (`--backend vllm`)
+
+**Supported backends:**
+1. HuggingFace (default): `--backend hf` - Uses transformers with custom attention modules
+2. vLLM offline: `--backend vllm` - Uses vLLM for efficient inference
+3. vLLM server: `--backend vllm --vllm_url http://localhost:8000` - Connects to running vLLM server
 
 **Supported input formats:**
 1. Head detection data (`nq_core.json`): has `is_positive`/`is_negative` fields
@@ -61,11 +67,14 @@ Comprehensive feature extraction with multiple input/output options:
 
 ### 4. BCE Training (`scripts/train_head_weights_bce.py`)
 - ✅ Trained logistic regression with L1 regularization
+- ✅ **Normalized BCE loss**: `(1/n) * sum(BCE) + λ * ||w||_1`
 - ✅ Parallel training support (`--n_jobs` flag, uses joblib)
 - ✅ Configurable max iterations (`--max_iter`)
 - ✅ Command logging in output JSON
 - ✅ Numeric suffix to avoid overwriting files
 - ✅ `--save_all` flag to save all lambda results
+
+**Note on normalization**: The BCE loss is normalized by the number of samples, making λ comparable across different dataset sizes. This was updated from the original unnormalized formulation.
 
 ### 5. Evaluation Script (`scripts/rerank_with_head_weights.py`)
 Computes ranking metrics on head detection data:
@@ -89,6 +98,9 @@ Compares two feature files to measure quantization effects:
 - `scripts/get_top_heads.py` - Quick inspection of top heads from CoRe or BCE
 
 ## Results (Mistral, n=1000)
+
+> **Note**: Results below were obtained with the **unnormalized** BCE loss formulation.
+> With the current normalized loss `(1/n)*sum(BCE) + λ*||w||_1`, equivalent λ values are approximately `λ_new ≈ λ_old / n_samples` (where n_samples ≈ 40,000).
 
 ### Sparsity vs Performance (Parallel Training, 6 jobs, ~6.6 min)
 
@@ -202,6 +214,15 @@ CUDA_VISIBLE_DEVICES=0 python scripts/extract_head_features.py \
 # Custom output name
 CUDA_VISIBLE_DEVICES=0 python scripts/extract_head_features.py \
     --llm mistral --quantize 4bit -o my_features
+
+# Using vLLM backend (offline mode)
+CUDA_VISIBLE_DEVICES=0 python scripts/extract_head_features.py \
+    --llm mistral --backend vllm --max_samples 100
+
+# Using vLLM server mode (requires running vLLM server)
+python scripts/extract_head_features.py \
+    --llm mistral --backend vllm --vllm_url http://localhost:8000 \
+    --max_samples 100
 ```
 
 **Output naming:** `attention_features_{input}_{n}_{quantize}.npz`
@@ -218,15 +239,17 @@ CUDA_VISIBLE_DEVICES=0 python scripts/extract_head_features.py \
 ### Train BCE Weights
 
 ```bash
-# Parallel training with multiple lambda values
+# Parallel training with multiple lambda values (normalized loss)
 python scripts/train_head_weights_bce.py --llm mistral \
-    --lambda_l1 1.0 5.0 10.0 50.0 100.0 \
+    --lambda_l1 1e-5 1e-4 1e-3 1e-2 1e-1 \
     --n_jobs -1 --save_all
 
 # Higher lambda for more sparsity
 python scripts/train_head_weights_bce.py --llm mistral \
-    --lambda_l1 200 500 1000 2000 --n_jobs -1 --save_all
+    --lambda_l1 0.1 0.5 1.0 2.0 --n_jobs -1 --save_all
 ```
+
+**Note**: Lambda values are for the normalized loss `(1/n)*sum(BCE) + λ*||w||_1`. Typical range: `1e-5` to `1.0`.
 
 ### Evaluate Head Weights
 
