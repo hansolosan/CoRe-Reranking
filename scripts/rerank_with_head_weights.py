@@ -12,40 +12,7 @@ import numpy as np
 from pathlib import Path
 from collections import defaultdict
 
-from utils import log_command
-
-
-def load_features(feature_file=None, llm_name=None, num_samples=None):
-    """Load extracted attention features.
-
-    Args:
-        feature_file: Path to feature file (if provided, llm_name and num_samples are ignored)
-        llm_name: LLM name for default path construction
-        num_samples: Number of samples for default path construction
-
-    Returns:
-        features, labels arrays
-    """
-    if feature_file is not None:
-        path = Path(feature_file)
-    else:
-        path = Path(__file__).parent.parent / 'head_data' / llm_name / f'attention_features_n{num_samples}.npz'
-
-    if not path.exists():
-        raise FileNotFoundError(f"Feature file not found: {path}")
-
-    data = np.load(path, allow_pickle=True)
-
-    # Handle different feature file formats
-    features = data['features']
-    labels = data['labels']
-
-    # Get docs_per_query if available
-    docs_per_query = None
-    if 'docs_per_query' in data:
-        docs_per_query = data['docs_per_query']
-
-    return features, labels, docs_per_query
+from utils import log_command, load_features, get_head_info
 
 
 def load_head_weights(weight_file, num_heads_per_layer=32, num_layers=32):
@@ -343,7 +310,7 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
 
         results.append({
             'config': label,
-            'weights': 'learned',
+            'weights': metadata['type'],
             'metrics': metrics
         })
 
@@ -409,14 +376,8 @@ def main():
     # Normalize metric names to lowercase
     args.metrics = [m.lower() for m in args.metrics]
 
-    # Model configs
-    model_configs = {
-        'mistral': (32, 32),
-        'llama': (32, 32),
-        'phi': (40, 40),
-        'granite': (40, 32),
-    }
-    num_layers, num_heads = model_configs[args.llm]
+    # Get model config
+    num_layers, num_heads = get_head_info(args.llm)
 
     print(f"Evaluating head weights for {args.llm}")
     print(f"Weight file: {args.weight_file}")

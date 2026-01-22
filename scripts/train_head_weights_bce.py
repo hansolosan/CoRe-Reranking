@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Train head weights using Binary Cross-Entropy loss with L1 regularization.
-This implements the logistic regression optimization proposed in the report.
+Train head weights using various loss functions with L1 regularization.
+
+Supported loss functions:
+- BCE: Binary Cross-Entropy (logistic regression)
+- InfoNCE: Contrastive loss for listwise ranking
 
 The loss is normalized by the number of samples:
-    Loss = (1/n) * sum(BCE_loss) + lambda * ||w||_1
+    Loss = (1/n) * sum(loss) + lambda * ||w||_1
 
 This makes lambda comparable across different dataset sizes.
 
@@ -23,13 +26,12 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 from joblib import Parallel, delayed
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore')
 
-from utils import log_command
+from utils import log_command, load_features, get_head_info
+from trainers import get_trainer, list_trainers
 
 
 def get_unique_filepath(base_path):
@@ -48,46 +50,6 @@ def get_unique_filepath(base_path):
         if not new_path.exists():
             return new_path
         counter += 1
-
-
-def load_features(feature_file=None, llm_name=None, num_samples=None):
-    """
-    Load extracted attention features.
-
-    Args:
-        feature_file: Path to feature file (.npz). If provided, llm_name and num_samples are ignored.
-        llm_name: LLM name for default path construction
-        num_samples: Number of samples for default path construction
-
-    Returns:
-        features, labels, docs_per_query arrays
-    """
-    if feature_file is not None:
-        path = Path(feature_file)
-    else:
-        if llm_name is None:
-            raise ValueError("Either feature_file or llm_name must be provided")
-        path = Path(__file__).parent.parent / 'head_data' / llm_name / f'attention_features_n{num_samples}.npz'
-
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Feature file not found: {path}\n"
-            f"Run extract_head_features.py first to generate features."
-        )
-
-    data = np.load(path)
-    features = data['features']
-    labels = data['labels']
-
-    # Get docs_per_query if available, otherwise assume 50
-    if 'docs_per_query' in data:
-        docs_per_query = data['docs_per_query']
-    else:
-        # Assume 50 docs per query (standard for NQ head detection data)
-        n_queries = len(labels) // 50
-        docs_per_query = np.full(n_queries, 50, dtype=np.int32)
-
-    return features, labels, docs_per_query
 
 
 def load_query_groups_from_json(json_file, num_samples=None):
@@ -231,76 +193,184 @@ def split_by_base_query(X, y, docs_per_query, val_split=0.2, random_state=42,
     return X_train, X_val, y_train, y_val, train_query_indices, val_query_indices, n_base_queries
 
 
-def get_head_info(llm_name):
-    """Get number of layers and heads for a model."""
-    model_configs = {
-        'mistral': (32, 32),   # 32 layers, 32 heads
-        'llama': (32, 32),     # 32 layers, 32 heads
-        'phi': (40, 40),       # 40 layers, 40 heads
-        'granite': (40, 32),   # 40 layers, 32 heads
-    }
-    return model_configs.get(llm_name, (32, 32))
-
-
-def train_logistic_regression(X_train, y_train, X_val, y_val, lambda_l1=0.01, max_iter=1000):
+def kfold_by_base_query(X, y, docs_per_query, n_folds=5, random_state=42,
+                        query_to_base=None, positions_per_query=5):
     """
-    Train L1-regularized logistic regression.
+    Generate k-fold cross-validation splits at the base query level.
 
-    sklearn's objective is: ||w||_1 + C * sum(log_loss)
-    We want normalized BCE: (1/n) * sum(log_loss) + lambda * ||w||_1
+    Yields train/val data for each fold, ensuring all position variations
+    of a query stay together in the same fold.
 
-    These objectives are equivalent (same minimizer) when:
-        lambda * ||w||_1 + (1/n) * sum = k * (||w||_1 + C * sum)
+    Args:
+        X: Feature matrix (n_docs, n_features)
+        y: Labels (n_docs,)
+        docs_per_query: Number of docs per query sample
+        n_folds: Number of CV folds
+        random_state: Random seed
+        query_to_base: List mapping query index to base query index
+        positions_per_query: Number of position variations per base query
 
-    Matching coefficients: k = lambda, and 1/n = k*C = lambda*C
-    Therefore: C = 1 / (n * lambda)
+    Yields:
+        (X_train, X_val, y_train, y_val, fold_idx, n_base_queries) for each fold
+    """
+    n_queries = len(docs_per_query)
+
+    # Determine query-to-base mapping
+    if query_to_base is not None:
+        n_base_queries = max(query_to_base) + 1
+    else:
+        n_base_queries = n_queries // positions_per_query
+        query_to_base = [q_idx // positions_per_query for q_idx in range(n_queries)]
+
+    # Create base query indices and shuffle
+    base_query_indices = np.arange(n_base_queries)
+    rng = np.random.RandomState(random_state)
+    rng.shuffle(base_query_indices)
+
+    # Compute fold sizes
+    fold_size = n_base_queries // n_folds
+    remainder = n_base_queries % n_folds
+
+    # Build document offset map for fast lookup
+    doc_offsets = np.zeros(n_queries + 1, dtype=np.int64)
+    doc_offsets[1:] = np.cumsum(docs_per_query)
+
+    # Generate folds
+    start = 0
+    for fold_idx in range(n_folds):
+        # This fold gets one extra if fold_idx < remainder
+        this_fold_size = fold_size + (1 if fold_idx < remainder else 0)
+        end = start + this_fold_size
+
+        val_base_indices = set(base_query_indices[start:end])
+
+        # Collect document indices for train/val
+        train_doc_indices = []
+        val_doc_indices = []
+
+        for q_idx in range(n_queries):
+            base_idx = query_to_base[q_idx]
+            doc_start = doc_offsets[q_idx]
+            doc_end = doc_offsets[q_idx + 1]
+            doc_indices = list(range(doc_start, doc_end))
+
+            if base_idx in val_base_indices:
+                val_doc_indices.extend(doc_indices)
+            else:
+                train_doc_indices.extend(doc_indices)
+
+        train_doc_indices = np.array(train_doc_indices)
+        val_doc_indices = np.array(val_doc_indices)
+
+        X_train = X[train_doc_indices]
+        X_val = X[val_doc_indices]
+        y_train = y[train_doc_indices]
+        y_val = y[val_doc_indices]
+
+        yield X_train, X_val, y_train, y_val, fold_idx, n_base_queries
+
+        start = end
+
+
+def train_single_lambda_cv(lambda_l1, X, y, docs_per_query, n_folds, num_layers, num_heads,
+                           max_iter, query_to_base, positions_per_query, loss='bce'):
+    """
+    Train a single lambda value with k-fold cross-validation.
+
+    Returns:
+        dict with lambda_l1, cv_metrics (mean/std), all_fold_metrics, and final model trained on all data
+    """
+    fold_metrics = []
+
+    for X_train, X_val, y_train, y_val, fold_idx, n_base_queries in kfold_by_base_query(
+        X, y, docs_per_query, n_folds=n_folds, random_state=42,
+        query_to_base=query_to_base, positions_per_query=positions_per_query
+    ):
+        # Standardize features for this fold
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
+
+        # Train model
+        trainer, metrics = train_model(
+            X_train_scaled, y_train, X_val_scaled, y_val,
+            lambda_l1=lambda_l1, max_iter=max_iter, loss=loss
+        )
+        fold_metrics.append(metrics)
+
+    # Aggregate metrics across folds
+    cv_metrics = {}
+    metric_keys = ['accuracy', 'precision', 'recall', 'f1', 'auc_roc', 'num_nonzero_weights', 'sparsity']
+    for key in metric_keys:
+        values = [m[key] for m in fold_metrics]
+        cv_metrics[f'{key}_mean'] = np.mean(values)
+        cv_metrics[f'{key}_std'] = np.std(values)
+
+    # Train final model on all data for saving weights
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    # For final model, we use a dummy split (train on all, evaluate on all)
+    final_trainer, _ = train_model(
+        X_scaled, y, X_scaled, y, lambda_l1=lambda_l1, max_iter=max_iter, loss=loss
+    )
+    weights = final_trainer.get_weights()
+    top_heads, all_heads = analyze_weights(weights, num_layers, num_heads, top_k=20)
+
+    return {
+        'lambda_l1': lambda_l1,
+        'trainer': final_trainer,
+        'cv_metrics': cv_metrics,
+        'fold_metrics': fold_metrics,
+        'top_heads': top_heads,
+        'all_heads': all_heads
+    }
+
+
+def train_model(X_train, y_train, X_val, y_val, lambda_l1=0.01, max_iter=1000,
+                loss='bce', docs_per_query_train=None, **trainer_kwargs):
+    """
+    Train a model using the specified loss function.
 
     Args:
         X_train, y_train: Training data
         X_val, y_val: Validation data
         lambda_l1: L1 regularization strength (normalized by num samples)
         max_iter: Maximum iterations for solver
+        loss: Loss function name ('bce', 'infonce')
+        docs_per_query_train: Docs per query (required for listwise losses)
+        **trainer_kwargs: Additional arguments for the trainer
 
     Returns:
-        model: Trained model
+        trainer: Trained trainer object
         metrics: Dictionary of evaluation metrics
     """
-    # Normalize by number of samples: C = 1 / (n * lambda)
-    # This makes lambda independent of dataset size
-    n_samples = len(y_train)
-    C = 1.0 / (n_samples * lambda_l1) if lambda_l1 > 0 else 1e6
-
-    model = LogisticRegression(
-        penalty='l1',
-        C=C,
-        solver='saga',
+    trainer = get_trainer(
+        loss,
+        lambda_l1=lambda_l1,
         max_iter=max_iter,
-        random_state=42,
-        class_weight='balanced'  # Handle class imbalance (1 pos vs 49 neg)
+        **trainer_kwargs
     )
 
-    model.fit(X_train, y_train)
+    trainer.fit(X_train, y_train, docs_per_query_train=docs_per_query_train)
+    metrics = trainer.evaluate(X_val, y_val)
 
-    # Evaluate
-    y_pred = model.predict(X_val)
-    y_prob = model.predict_proba(X_val)[:, 1]
-
-    metrics = {
-        'accuracy': accuracy_score(y_val, y_pred),
-        'precision': precision_score(y_val, y_pred),
-        'recall': recall_score(y_val, y_pred),
-        'f1': f1_score(y_val, y_pred),
-        'auc_roc': roc_auc_score(y_val, y_prob),
-        'num_nonzero_weights': np.sum(np.abs(model.coef_[0]) > 1e-6),
-        'sparsity': 1.0 - np.sum(np.abs(model.coef_[0]) > 1e-6) / len(model.coef_[0])
-    }
-
-    return model, metrics
+    return trainer, metrics
 
 
-def analyze_weights(model, num_layers, num_heads, top_k=20):
-    """Analyze learned head weights."""
-    weights = model.coef_[0]
+def analyze_weights(weights, num_layers, num_heads, top_k=20):
+    """
+    Analyze learned head weights.
+
+    Args:
+        weights: Weight array from trainer.get_weights()
+        num_layers: Number of layers in model
+        num_heads: Number of heads per layer
+        top_k: Number of top heads to return
+
+    Returns:
+        top_heads: List of top-k heads by absolute weight
+        all_heads: List of all heads with weights
+    """
 
     # Create head index mapping
     head_weights = []
@@ -373,14 +443,16 @@ def convert_to_native(obj):
 
 
 def save_results(output_dir, lambda_l1, num_samples, metrics, top_heads, all_heads, command,
-                 n_train_docs=None, n_val_docs=None, n_train_base_queries=None, n_val_base_queries=None):
+                 n_train_docs=None, n_val_docs=None, n_train_base_queries=None, n_val_base_queries=None,
+                 loss='bce'):
     """Save results for a single lambda value."""
-    base_file = output_dir / f'bce_weights_lambda{lambda_l1}_n{num_samples}.json'
+    base_file = output_dir / f'{loss}_weights_lambda{lambda_l1}_n{num_samples}.json'
     output_file = get_unique_filepath(base_file)
 
     results = {
         'command': command,
         'timestamp': datetime.now().isoformat(),
+        'loss': loss,
         'lambda_l1': float(lambda_l1),
         'num_samples': int(num_samples),
         'metrics': convert_to_native(metrics),
@@ -403,21 +475,24 @@ def save_results(output_dir, lambda_l1, num_samples, metrics, top_heads, all_hea
     return output_file
 
 
-def train_single_lambda(lambda_l1, X_train, y_train, X_val, y_val, num_layers, num_heads, max_iter=1000):
+def train_single_lambda(lambda_l1, X_train, y_train, X_val, y_val, num_layers, num_heads,
+                        max_iter=1000, loss='bce'):
     """
     Train a single model for one lambda value. Designed for parallel execution.
 
     Returns:
         dict with lambda_l1, metrics, top_heads, all_heads
     """
-    model, metrics = train_logistic_regression(
-        X_train, y_train, X_val, y_val, lambda_l1, max_iter=max_iter
+    trainer, metrics = train_model(
+        X_train, y_train, X_val, y_val,
+        lambda_l1=lambda_l1, max_iter=max_iter, loss=loss
     )
-    top_heads, all_heads = analyze_weights(model, num_layers, num_heads, top_k=20)
+    weights = trainer.get_weights()
+    top_heads, all_heads = analyze_weights(weights, num_layers, num_heads, top_k=20)
 
     return {
         'lambda_l1': lambda_l1,
-        'model': model,
+        'trainer': trainer,
         'metrics': metrics,
         'top_heads': top_heads,
         'all_heads': all_heads
@@ -438,8 +513,13 @@ def main():
     parser.add_argument('--lambda_l1', type=float, nargs='+',
                         default=[1e-5, 1e-4, 1e-3, 1e-2, 1e-1],
                         help='L1 regularization strengths to try (normalized by num samples)')
+    parser.add_argument('--loss', type=str, default='bce',
+                        choices=list_trainers(),
+                        help=f'Loss function to use: {", ".join(list_trainers())} (default: bce)')
     parser.add_argument('--val_split', type=float, default=0.2,
-                        help='Validation split ratio')
+                        help='Validation split ratio (ignored if --cv is used)')
+    parser.add_argument('--cv', type=int, default=None,
+                        help='Number of cross-validation folds. If set, uses k-fold CV instead of single split.')
     parser.add_argument('--temp', type=float, default=0.001,
                         help='Temperature used for CoRe head detection (for comparison)')
     parser.add_argument('--save_best_only', action='store_true',
@@ -457,6 +537,7 @@ def main():
     command = ' '.join(sys.argv)
 
     print(f"Training head weights for {args.llm}")
+    print(f"Loss function: {args.loss}")
     print(f"L1 regularization values: {args.lambda_l1}")
 
     # Load features
@@ -472,7 +553,14 @@ def main():
         )
     except FileNotFoundError as e:
         print(e)
+        print("Run extract_head_features.py first to generate features.")
         return
+
+    # Handle missing docs_per_query (assume 50 docs per query, standard for NQ)
+    if docs_per_query is None:
+        n_queries = len(y) // 50
+        docs_per_query = np.full(n_queries, 50, dtype=np.int32)
+        print(f"docs_per_query not found in file, assuming 50 docs per query")
 
     print(f"Features shape: {X.shape}")
     print(f"Labels shape: {y.shape}")
@@ -509,31 +597,6 @@ def main():
         else:
             print(f"\nNo input JSON file found, assuming 5 position variations per query")
 
-    # Split data BY BASE QUERY (all variations stay together)
-    X_train, X_val, y_train, y_val, train_q_idx, val_q_idx, n_base_queries = split_by_base_query(
-        X, y, docs_per_query, val_split=args.val_split, random_state=42,
-        query_to_base=query_to_base, positions_per_query=5
-    )
-
-    # Calculate number of base queries in each split
-    if query_to_base is not None:
-        train_base_set = set(query_to_base[q] for q in train_q_idx)
-        val_base_set = set(query_to_base[q] for q in val_q_idx)
-        n_train_base = len(train_base_set)
-        n_val_base = len(val_base_set)
-    else:
-        n_train_base = len(train_q_idx) // 5
-        n_val_base = len(val_q_idx) // 5
-
-    print(f"\nSplit by base query (no overlap between train/val):")
-    print(f"  Train: {len(y_train)} docs from {len(train_q_idx)} query samples ({n_train_base} base queries)")
-    print(f"  Val:   {len(y_val)} docs from {len(val_q_idx)} query samples ({n_val_base} base queries)")
-
-    # Standardize features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.transform(X_val)
-
     # Train with different regularization strengths
     output_dir = Path(__file__).parent.parent / 'head_data' / args.llm
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -542,70 +605,178 @@ def main():
     if n_jobs == -1:
         n_jobs = os.cpu_count() or 1
 
-    print(f"\n{'='*60}")
-    print(f"Training Results (n_jobs={n_jobs}, max_iter={args.max_iter})")
-    print('='*60)
-
-    if n_jobs > 1 and len(args.lambda_l1) > 1:
-        # Parallel training
-        print(f"Training {len(args.lambda_l1)} models in parallel...")
-        all_results = Parallel(n_jobs=n_jobs, verbose=10)(
-            delayed(train_single_lambda)(
-                lambda_l1, X_train_scaled, y_train, X_val_scaled, y_val,
-                num_layers, num_heads, args.max_iter
-            )
-            for lambda_l1 in args.lambda_l1
-        )
-        # Sort by lambda for consistent ordering
-        all_results.sort(key=lambda x: x['lambda_l1'])
-
-        # Print results table after parallel completion
-        print(f"\n{'Lambda':<10} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1':<10} {'AUC-ROC':<10} {'Non-zero':<10} {'Sparsity':<10}")
-        print('-'*90)
-        for result in all_results:
-            metrics = result['metrics']
-            print(f"{result['lambda_l1']:<10.4f} {metrics['accuracy']:<10.4f} {metrics['precision']:<10.4f} "
-                  f"{metrics['recall']:<10.4f} {metrics['f1']:<10.4f} {metrics['auc_roc']:<10.4f} "
-                  f"{metrics['num_nonzero_weights']:<10d} {metrics['sparsity']:<10.4f}")
+    # Determine n_base_queries for reporting
+    if query_to_base is not None:
+        n_base_queries = max(query_to_base) + 1
     else:
-        # Sequential training (original behavior)
-        print(f"{'Lambda':<10} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1':<10} {'AUC-ROC':<10} {'Non-zero':<10} {'Sparsity':<10}")
-        print('-'*90)
-        all_results = []
-        for lambda_l1 in args.lambda_l1:
-            result = train_single_lambda(
-                lambda_l1, X_train_scaled, y_train, X_val_scaled, y_val,
-                num_layers, num_heads, args.max_iter
+        n_base_queries = n_queries // 5
+
+    # Cross-validation or single split
+    if args.cv is not None and args.cv > 1:
+        # K-fold cross-validation mode
+        print(f"\n{'='*60}")
+        print(f"Training with {args.cv}-fold Cross-Validation (n_jobs={n_jobs}, max_iter={args.max_iter})")
+        print(f"Base queries: {n_base_queries} (split at base query level)")
+        print('='*60)
+
+        if n_jobs > 1 and len(args.lambda_l1) > 1:
+            n_jobs = min(n_jobs, len(args.lambda_l1))
+            print(f"Training {len(args.lambda_l1)} lambda values in parallel...")
+            all_results = Parallel(n_jobs=n_jobs, verbose=10)(
+                delayed(train_single_lambda_cv)(
+                    lambda_l1, X, y, docs_per_query, args.cv,
+                    num_layers, num_heads, args.max_iter,
+                    query_to_base, 5, args.loss
+                )
+                for lambda_l1 in args.lambda_l1
             )
-            all_results.append(result)
+            all_results.sort(key=lambda x: x['lambda_l1'])
+        else:
+            all_results = []
+            for lambda_l1 in args.lambda_l1:
+                print(f"Training lambda={lambda_l1}...")
+                result = train_single_lambda_cv(
+                    lambda_l1, X, y, docs_per_query, args.cv,
+                    num_layers, num_heads, args.max_iter,
+                    query_to_base, 5, args.loss
+                )
+                all_results.append(result)
 
-            # Print immediately in sequential mode
-            metrics = result['metrics']
-            print(f"{lambda_l1:<10.4f} {metrics['accuracy']:<10.4f} {metrics['precision']:<10.4f} "
-                  f"{metrics['recall']:<10.4f} {metrics['f1']:<10.4f} {metrics['auc_roc']:<10.4f} "
-                  f"{metrics['num_nonzero_weights']:<10d} {metrics['sparsity']:<10.4f}", flush=True)
+        # Print CV results table (mean ± std)
+        print(f"\n{'Lambda':<10} {'Accuracy':<16} {'Precision':<16} {'Recall':<16} {'F1':<16} {'AUC-ROC':<16} {'Non-zero':<12} {'Sparsity':<16}")
+        print('-'*120)
+        for result in all_results:
+            m = result['cv_metrics']
+            print(f"{result['lambda_l1']:<10.4f} "
+                  f"{m['accuracy_mean']:.4f}±{m['accuracy_std']:.3f}  "
+                  f"{m['precision_mean']:.4f}±{m['precision_std']:.3f}  "
+                  f"{m['recall_mean']:.4f}±{m['recall_std']:.3f}  "
+                  f"{m['f1_mean']:.4f}±{m['f1_std']:.3f}  "
+                  f"{m['auc_roc_mean']:.4f}±{m['auc_roc_std']:.3f}  "
+                  f"{m['num_nonzero_weights_mean']:.1f}±{m['num_nonzero_weights_std']:.1f}  "
+                  f"{m['sparsity_mean']:.4f}±{m['sparsity_std']:.3f}")
 
-    # Find best model and save results
-    best_result = max(all_results, key=lambda x: x['metrics']['auc_roc'])
-    best_lambda = best_result['lambda_l1']
-    best_auc = best_result['metrics']['auc_roc']
+        # Find best model by mean AUC-ROC
+        best_result = max(all_results, key=lambda x: x['cv_metrics']['auc_roc_mean'])
+        best_lambda = best_result['lambda_l1']
+        best_auc = best_result['cv_metrics']['auc_roc_mean']
+        best_auc_std = best_result['cv_metrics']['auc_roc_std']
 
-    # Save results
-    for result in all_results:
-        if not args.save_best_only or result['lambda_l1'] == best_lambda:
-            output_file = save_results(
-                output_dir, result['lambda_l1'], args.num_samples,
-                result['metrics'], result['top_heads'],
-                result['all_heads'], command,
-                n_train_docs=len(y_train),
-                n_val_docs=len(y_val),
-                n_train_base_queries=n_train_base,
-                n_val_base_queries=n_val_base
+        # Save results (final model trained on all data)
+        for result in all_results:
+            if not args.save_best_only or result['lambda_l1'] == best_lambda:
+                # Use cv_metrics for saving, converting mean values to the expected format
+                save_metrics = {k.replace('_mean', ''): v for k, v in result['cv_metrics'].items() if '_mean' in k}
+                save_metrics['cv_folds'] = args.cv
+                save_metrics['cv_std'] = {k.replace('_std', ''): v for k, v in result['cv_metrics'].items() if '_std' in k}
+
+                output_file = save_results(
+                    output_dir, result['lambda_l1'], args.num_samples,
+                    save_metrics, result['top_heads'],
+                    result['all_heads'], command,
+                    n_train_docs=len(y),
+                    n_val_docs=0,
+                    n_train_base_queries=n_base_queries,
+                    n_val_base_queries=0,
+                    loss=args.loss
+                )
+                if not args.save_best_only:
+                    print(f"  Saved lambda={result['lambda_l1']} to {output_file}")
+
+        print(f"\nBest model: lambda={best_lambda}, AUC-ROC={best_auc:.4f}±{best_auc_std:.4f}")
+
+    else:
+        # Single train/val split mode (original behavior)
+        X_train, X_val, y_train, y_val, train_q_idx, val_q_idx, n_base_queries = split_by_base_query(
+            X, y, docs_per_query, val_split=args.val_split, random_state=42,
+            query_to_base=query_to_base, positions_per_query=5
+        )
+
+        # Calculate number of base queries in each split
+        if query_to_base is not None:
+            train_base_set = set(query_to_base[q] for q in train_q_idx)
+            val_base_set = set(query_to_base[q] for q in val_q_idx)
+            n_train_base = len(train_base_set)
+            n_val_base = len(val_base_set)
+        else:
+            n_train_base = len(train_q_idx) // 5
+            n_val_base = len(val_q_idx) // 5
+
+        print(f"\nSplit by base query (no overlap between train/val):")
+        print(f"  Train: {len(y_train)} docs from {len(train_q_idx)} query samples ({n_train_base} base queries)")
+        print(f"  Val:   {len(y_val)} docs from {len(val_q_idx)} query samples ({n_val_base} base queries)")
+
+        # Standardize features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_val_scaled = scaler.transform(X_val)
+
+        print(f"\n{'='*60}")
+        print(f"Training Results (n_jobs={n_jobs}, max_iter={args.max_iter})")
+        print('='*60)
+
+        if n_jobs > 1 and len(args.lambda_l1) > 1:
+            n_jobs = min(n_jobs, len(args.lambda_l1))
+            # Parallel training
+            print(f"Training {len(args.lambda_l1)} models in parallel...")
+            all_results = Parallel(n_jobs=n_jobs, verbose=10)(
+                delayed(train_single_lambda)(
+                    lambda_l1, X_train_scaled, y_train, X_val_scaled, y_val,
+                    num_layers, num_heads, args.max_iter, args.loss
+                )
+                for lambda_l1 in args.lambda_l1
             )
-            if not args.save_best_only:
-                print(f"  Saved lambda={result['lambda_l1']} to {output_file}")
+            # Sort by lambda for consistent ordering
+            all_results.sort(key=lambda x: x['lambda_l1'])
 
-    print(f"\nBest model: lambda={best_lambda}, AUC-ROC={best_auc:.4f}")
+            # Print results table after parallel completion
+            print(f"\n{'Lambda':<10} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1':<10} {'AUC-ROC':<10} {'Non-zero':<10} {'Sparsity':<10}")
+            print('-'*90)
+            for result in all_results:
+                metrics = result['metrics']
+                print(f"{result['lambda_l1']:<10.4f} {metrics['accuracy']:<10.4f} {metrics['precision']:<10.4f} "
+                      f"{metrics['recall']:<10.4f} {metrics['f1']:<10.4f} {metrics['auc_roc']:<10.4f} "
+                      f"{metrics['num_nonzero_weights']:<10d} {metrics['sparsity']:<10.4f}")
+        else:
+            # Sequential training (original behavior)
+            print(f"{'Lambda':<10} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1':<10} {'AUC-ROC':<10} {'Non-zero':<10} {'Sparsity':<10}")
+            print('-'*90)
+            all_results = []
+            for lambda_l1 in args.lambda_l1:
+                result = train_single_lambda(
+                    lambda_l1, X_train_scaled, y_train, X_val_scaled, y_val,
+                    num_layers, num_heads, args.max_iter, args.loss
+                )
+                all_results.append(result)
+
+                # Print immediately in sequential mode
+                metrics = result['metrics']
+                print(f"{lambda_l1:<10.4f} {metrics['accuracy']:<10.4f} {metrics['precision']:<10.4f} "
+                      f"{metrics['recall']:<10.4f} {metrics['f1']:<10.4f} {metrics['auc_roc']:<10.4f} "
+                      f"{metrics['num_nonzero_weights']:<10d} {metrics['sparsity']:<10.4f}", flush=True)
+
+        # Find best model and save results
+        best_result = max(all_results, key=lambda x: x['metrics']['auc_roc'])
+        best_lambda = best_result['lambda_l1']
+        best_auc = best_result['metrics']['auc_roc']
+
+        # Save results
+        for result in all_results:
+            if not args.save_best_only or result['lambda_l1'] == best_lambda:
+                output_file = save_results(
+                    output_dir, result['lambda_l1'], args.num_samples,
+                    result['metrics'], result['top_heads'],
+                    result['all_heads'], command,
+                    n_train_docs=len(y_train),
+                    n_val_docs=len(y_val),
+                    n_train_base_queries=n_train_base,
+                    n_val_base_queries=n_val_base,
+                    loss=args.loss
+                )
+                if not args.save_best_only:
+                    print(f"  Saved lambda={result['lambda_l1']} to {output_file}")
+
+        print(f"\nBest model: lambda={best_lambda}, AUC-ROC={best_auc:.4f}")
 
     # Get best model results from stored data
     best_result = next(r for r in all_results if r['lambda_l1'] == best_lambda)

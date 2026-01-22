@@ -65,9 +65,18 @@ Comprehensive feature extraction with multiple input/output options:
 1. Head detection data (`nq_core.json`): has `is_positive`/`is_negative` fields
 2. Retriever output (`retriever_output/*.json`): uses qrels for labels
 
-### 4. BCE Training (`scripts/train_head_weights_bce.py`)
-- ✅ Trained logistic regression with L1 regularization
-- ✅ **Normalized BCE loss**: `(1/n) * sum(BCE) + λ * ||w||_1`
+### 4. Modular Trainer Architecture (`scripts/trainers.py`)
+Modular trainer classes for easy loss function swapping:
+- **BaseTrainer**: Abstract base class with common interface
+- **BCETrainer**: Binary Cross-Entropy with L1 regularization (sklearn LogisticRegression)
+- **InfoNCETrainer**: Contrastive loss for listwise ranking (proximal gradient descent)
+- Factory function: `get_trainer(name, **kwargs)` returns trainer instance
+- All trainers implement: `fit()`, `predict_proba()`, `predict()`, `evaluate()`, `get_weights()`
+
+### 5. Head Weight Training (`scripts/train_head_weights_bce.py`)
+- ✅ **Modular loss functions**: `--loss bce` or `--loss infonce`
+- ✅ **Normalized loss**: `(1/n) * sum(loss) + λ * ||w||_1`
+- ✅ **K-fold cross-validation**: `--cv 5` for 5-fold CV at base query level
 - ✅ Parallel training support (`--n_jobs` flag, uses joblib)
 - ✅ Configurable max iterations (`--max_iter`)
 - ✅ Command logging in output JSON
@@ -77,30 +86,44 @@ Comprehensive feature extraction with multiple input/output options:
 - ✅ Query-level train/val split (no data leakage between base queries)
 - ✅ JSON-based query grouping (`--input_file` to load query variations)
 
-**Note on normalization**: The BCE loss is normalized by the number of samples, making λ comparable across different dataset sizes. This was updated from the original unnormalized formulation.
+**Note on normalization**: The loss is normalized by the number of samples, making λ comparable across different dataset sizes.
 
 **Note on data splitting**: Train/val split is done at the BASE QUERY level. The NQ data has 5 position variations per base query, and all variations stay together in the same split to prevent data leakage.
 
-### 5. Evaluation Script (`scripts/rerank_with_head_weights.py`)
+### 6. Evaluation Script (`scripts/rerank_with_head_weights.py`)
 Computes ranking metrics on head detection data:
 - **NDCG@k** (k=1,5,10)
 - **Precision@k** (k=1,5,10)
+- **Match@k** (hit rate: 1 if any relevant in top-k)
 - **MAP** (Mean Average Precision)
 - **MRR** (Mean Reciprocal Rank)
 - Supports comparison of learned vs equal weights
 - Works with both BCE and CoRe weight files
 - ✅ Multiple feature files (`-f file1.npz file2.npz ...`)
-- ✅ Combined results table for all files
+- ✅ Combined results table with color-coded max values (green=global, blue=per-file)
+- ✅ Selectable metrics (`--metrics ndcg p m map mrr`)
 - ✅ Optional JSON output (`--output` / `-o`)
+- ✅ Uses shared utilities from `utils.py`
 
-### 6. Feature Comparison (`scripts/compare_features.py`) — NEW
+### 7. Feature Comparison (`scripts/compare_features.py`)
 Compares two feature files to measure quantization effects:
 - **Ranking metrics**: NDCG@k, P@k, Kendall's τ, Spearman's ρ, RBO, Top-1 match
 - **Feature metrics**: MSE, RMSE, MAE, Pearson r, Cosine similarity
 - **Per-head analysis**: Identifies worst-performing attention heads
 - Useful for validating quantized model outputs against full precision
 
-### 7. Analysis Scripts
+### 8. Head Correlation Analysis (`scripts/analyze_head_correlations.py`)
+Analyzes correlations between attention heads relative to relevance:
+- **Head-to-relevance correlation**: Point-biserial correlation with binary labels
+- **Inter-head correlation matrix**: Pearson/Spearman between all head pairs
+- **Conditional correlation**: Separate analysis for positive vs negative documents
+- **Partial correlation**: Inter-head correlation controlling for relevance
+- **Head clustering**: Hierarchical clustering based on correlation patterns
+- **Diverse head selection**: Greedy algorithm balancing relevance + low redundancy
+- ✅ Visualization plots (heatmaps, dendrograms, bar charts)
+- ✅ JSON output for programmatic analysis
+
+### 9. Analysis Scripts
 - `scripts/compare_head_selection.py` - Compare CoRe vs BCE methods, compute AUC-ROC
 - `scripts/analyze_sparsity.py` - Analyze sparsity across lambda values with plotting
 - `scripts/get_top_heads.py` - Quick inspection of top heads from CoRe or BCE
@@ -162,7 +185,7 @@ Current AUC-ROC metrics are computed on a **20% held-out validation split** from
 2. **Try higher λ values** to approach 8 heads
 3. **Integrate with reranker** - Modify `reranking.py` to use learned BCE weights
 4. **Evaluate on BEIR** - Test generalization on out-of-distribution datasets
-5. **Implement listwise cross-entropy** - Create `train_head_weights_ce.py` with InfoNCE loss
+5. **Implement listwise cross-entropy** - ✅ InfoNCE implemented in `trainers.py`
 
 ## File Structure
 
@@ -172,11 +195,13 @@ CoRe-Reranking/
 │   ├── head_selection_report.tex    # LaTeX report with equations
 │   └── optimization_progress.md     # This document
 ├── scripts/
-│   ├── utils.py                     # Shared utilities (command logging)
+│   ├── utils.py                     # Shared utilities (feature loading, model configs, command logging)
+│   ├── trainers.py                  # Modular trainer classes (BCE, InfoNCE)
 │   ├── analyze_head_data.py         # Data analysis script
 │   ├── extract_head_features.py     # Feature extraction (+ quantization)
-│   ├── train_head_weights_bce.py    # BCE + L1 optimization (parallel)
+│   ├── train_head_weights_bce.py    # Head weight training (supports BCE/InfoNCE, CV)
 │   ├── rerank_with_head_weights.py  # Ranking metrics evaluation (multi-file)
+│   ├── analyze_head_correlations.py # Head correlation analysis (+ clustering, plots)
 │   ├── compare_features.py          # Compare feature files
 │   ├── compare_head_selection.py    # Compare methods (AUC-ROC)
 │   ├── analyze_sparsity.py          # Sparsity analysis with plotting
@@ -245,20 +270,29 @@ python scripts/extract_head_features.py \
 | 8bit | ~8 GB |
 | 4bit | ~5 GB |
 
-### Train BCE Weights
+### Train Head Weights
 
 ```bash
-# Parallel training with multiple lambda values (normalized loss)
-# All lambda results saved by default
+# BCE loss with parallel training (default)
 python scripts/train_head_weights_bce.py --llm mistral \
     --lambda_l1 1e-5 1e-4 1e-3 1e-2 1e-1 \
     --n_jobs -1
+
+# InfoNCE (contrastive) loss
+python scripts/train_head_weights_bce.py --llm mistral \
+    --loss infonce \
+    --lambda_l1 1e-3 1e-2 1e-1 --n_jobs -1
+
+# K-fold cross-validation (5-fold)
+python scripts/train_head_weights_bce.py --llm mistral \
+    --lambda_l1 1e-3 1e-2 1e-1 \
+    --cv 5 --n_jobs -1
 
 # Higher lambda for more sparsity
 python scripts/train_head_weights_bce.py --llm mistral \
     --lambda_l1 0.1 0.5 1.0 2.0 --n_jobs -1
 
-# Direct feature file input (instead of constructing path from --llm and --num_samples)
+# Direct feature file input
 python scripts/train_head_weights_bce.py --llm mistral \
     -f head_data/mistral/attention_features_custom.npz \
     --lambda_l1 1e-3 1e-2 1e-1 --n_jobs -1
@@ -269,7 +303,9 @@ python scripts/train_head_weights_bce.py --llm mistral \
     --lambda_l1 1e-3 1e-2 1e-1 --n_jobs -1
 ```
 
-**Note**: Lambda values are for the normalized loss `(1/n)*sum(BCE) + λ*||w||_1`. Typical range: `1e-5` to `1.0`.
+**Note**: Lambda values are for the normalized loss `(1/n)*sum(loss) + λ*||w||_1`. Typical range: `1e-5` to `1.0`.
+
+**Available loss functions**: `bce` (Binary Cross-Entropy, default), `infonce` (contrastive ranking loss)
 
 ### Evaluate Head Weights
 
@@ -311,6 +347,29 @@ python scripts/compare_features.py \
     -r features_fp16.npz -s features_4bit.npz \
     -w head_data/mistral/bce_weights_lambda100.0_n1000.json
 ```
+
+### Analyze Head Correlations
+
+```bash
+# Basic correlation analysis
+python scripts/analyze_head_correlations.py --llm mistral --num_samples 1000
+
+# With plots and JSON output
+python scripts/analyze_head_correlations.py --llm mistral \
+    -f head_data/mistral/attention_features_n1000.npz \
+    --plot --output head_data/mistral/correlation_analysis.json
+
+# Spearman correlation and more diverse heads
+python scripts/analyze_head_correlations.py --llm mistral \
+    --method spearman --diverse_k 16 --plot
+```
+
+**Generated plots** (in `head_data/{llm}/plots/`):
+- `inter_head_corr_pearson.png` - Full correlation matrix heatmap
+- `head_relevance_corr.png` - Bar chart of head-to-relevance correlations
+- `head_clustering_dendrogram.png` - Hierarchical clustering tree
+- `conditional_corr_diff.png` - Positive vs negative document correlations
+- `partial_corr.png` - Correlation after controlling for relevance
 
 ### Analyze Sparsity
 
