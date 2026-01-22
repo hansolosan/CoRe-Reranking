@@ -37,6 +37,7 @@ LLM="mistral"
 QRELS=""
 MAX_DOC_TOKENS=300
 MAX_SAMPLES=""
+BATCH_SIZE=""
 OUTPUT_DIR=""
 DRY_RUN=false
 EXTRA_ARGS=""
@@ -66,6 +67,7 @@ Required arguments:
 Optional arguments:
   --max_doc_tokens N    Max tokens per document (default: 300)
   --max_samples N       Max number of query samples to process
+  --batch_size N        Batch size for inference (default: 1)
   --output_dir DIR      Output directory (default: head_data/{llm})
   --dry_run             Print commands without executing
   --extra_args "ARGS"   Additional arguments to pass to extract_head_features.py
@@ -117,6 +119,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --max_samples)
             MAX_SAMPLES="$2"
+            shift 2
+            ;;
+        --batch_size)
+            BATCH_SIZE="$2"
             shift 2
             ;;
         --output_dir)
@@ -221,6 +227,7 @@ echo "LLM:                $LLM"
 echo "Qrels file:         $QRELS"
 echo "Max doc tokens:     $MAX_DOC_TOKENS"
 echo "Max samples:        ${MAX_SAMPLES:-all}"
+echo "Batch size:         ${BATCH_SIZE:-1}"
 echo "Output directory:   $OUTPUT_DIR"
 echo "Max docs values:    ${MAX_DOCS_LIST[*]}"
 echo "Input files:        ${#INPUT_FILES[@]} file(s)"
@@ -309,6 +316,10 @@ for INPUT_FILE in "${INPUT_FILES[@]}"; do
 
         if [[ -n "$MAX_SAMPLES" ]]; then
             CMD="$CMD --max_samples $MAX_SAMPLES"
+        fi
+
+        if [[ -n "$BATCH_SIZE" ]]; then
+            CMD="$CMD --batch_size $BATCH_SIZE"
         fi
 
         if [[ -n "$EXTRA_ARGS" ]]; then
