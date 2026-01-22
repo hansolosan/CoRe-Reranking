@@ -312,7 +312,8 @@ for INPUT_FILE in "${INPUT_FILES[@]}"; do
         CMD="$CMD --qrels \"$QRELS\""
         CMD="$CMD --max_docs $MAX_DOCS"
         CMD="$CMD --max_doc_tokens $MAX_DOC_TOKENS"
-        CMD="$CMD -o \"$OUTPUT_NAME\""
+        CMD="$CMD --output_dir \"$OUTPUT_DIR\""
+        CMD="$CMD --output_name \"$OUTPUT_NAME\""
 
         if [[ -n "$MAX_SAMPLES" ]]; then
             CMD="$CMD --max_samples $MAX_SAMPLES"
