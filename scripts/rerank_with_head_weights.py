@@ -151,19 +151,20 @@ def match_at_k(relevances, k):
 
 
 def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=None,
-                     ks=[1, 5, 10], metric_types=None):
+                     ks=[1, 5, 10], metric_types=None, use_baseline=False):
     """
     Evaluate ranking metrics.
 
     Args:
         features: (num_docs, num_heads) attention features
         labels: (num_docs,) binary relevance labels
-        weights: (num_heads,) head weights
+        weights: (num_heads,) head weights (ignored if use_baseline=True)
         docs_per_query: number of documents per query (int) or array of docs per query
         top_k_heads: if set, only use top-k heads
         ks: list of k values for @k metrics
         metric_types: list of metric types to compute ('ndcg', 'p', 'm', 'map', 'mrr')
                      If None, computes all metrics.
+        use_baseline: if True, use original document order as baseline (no reranking)
 
     Returns:
         metrics: dict of metric name -> value
@@ -172,7 +173,11 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
         metric_types = ['ndcg', 'p', 'm', 'map', 'mrr']
 
     # Compute scores
-    scores = compute_scores(features, weights, top_k=top_k_heads)
+    if use_baseline:
+        # For baseline, use descending scores to preserve original order
+        scores = np.arange(len(features), 0, -1, dtype=float)
+    else:
+        scores = compute_scores(features, weights, top_k=top_k_heads)
 
     # Initialize collectors for requested metrics
     compute_ndcg = 'ndcg' in metric_types
@@ -295,8 +300,23 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
         print(f"\n{file_label}: {X.shape[0]} docs, {num_queries} queries, "
               f"{(y == 1).sum()} positive ({100*(y == 1).mean():.1f}%)")
 
+    # Evaluate baseline (original retriever ranking) first
+    baseline_metrics = evaluate_ranking(
+        X, y, weights=None,
+        docs_per_query=docs_per_query,
+        top_k_heads=None,
+        ks=ks,
+        metric_types=metric_types,
+        use_baseline=True
+    )
+
+    results = [{
+        'config': 'baseline',
+        'weights': 'retriever',
+        'metrics': baseline_metrics
+    }]
+
     # Evaluate for each top_k setting
-    results = []
     for top_k in top_k_list:
         label = f"top-{top_k}" if top_k else "all"
 
