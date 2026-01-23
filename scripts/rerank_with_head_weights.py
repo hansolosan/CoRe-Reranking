@@ -267,9 +267,12 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
 
 def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, metadata,
                                   top_k_list, ks, metric_types, docs_per_query_override,
-                                  compare_equal, verbose=True):
+                                  compare_equal, include_baseline=True, verbose=True):
     """
     Evaluate a single feature file and return results.
+
+    Args:
+        include_baseline: if True, compute and include baseline retriever performance
 
     Returns:
         dict with feature_file info and results list
@@ -300,21 +303,23 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
         print(f"\n{file_label}: {X.shape[0]} docs, {num_queries} queries, "
               f"{(y == 1).sum()} positive ({100*(y == 1).mean():.1f}%)")
 
-    # Evaluate baseline (original retriever ranking) first
-    baseline_metrics = evaluate_ranking(
-        X, y, weights=None,
-        docs_per_query=docs_per_query,
-        top_k_heads=None,
-        ks=ks,
-        metric_types=metric_types,
-        use_baseline=True
-    )
+    # Evaluate baseline (original retriever ranking) first if requested
+    results = []
+    if include_baseline:
+        baseline_metrics = evaluate_ranking(
+            X, y, weights=None,
+            docs_per_query=docs_per_query,
+            top_k_heads=None,
+            ks=ks,
+            metric_types=metric_types,
+            use_baseline=True
+        )
 
-    results = [{
-        'config': 'baseline',
-        'weights': 'retriever',
-        'metrics': baseline_metrics
-    }]
+        results.append({
+            'config': 'baseline',
+            'weights': 'retriever',
+            'metrics': baseline_metrics
+        })
 
     # Evaluate for each top_k setting
     for top_k in top_k_list:
@@ -389,6 +394,8 @@ def main():
                         help='Metrics to compute: ndcg, p (precision), m (match), map, mrr (default: all)')
     parser.add_argument('--compare_equal', action='store_true',
                         help='Also compare with equal weights on same heads')
+    parser.add_argument('--no_baseline', action='store_true',
+                        help='Skip computing baseline retriever performance')
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='Output file for metrics JSON (optional, no save if not specified)')
     args = parser.parse_args()
@@ -439,6 +446,7 @@ def main():
             metric_types=args.metrics,
             docs_per_query_override=args.docs_per_query,
             compare_equal=args.compare_equal,
+            include_baseline=not args.no_baseline,
             verbose=True
         )
         all_file_results.append(file_results)
