@@ -14,6 +14,13 @@ from collections import defaultdict
 
 from utils import log_command, load_features, get_head_info
 
+# Try to import BEIR evaluator (optional)
+try:
+    from beir.retrieval.evaluation import EvaluateRetrieval
+    BEIR_AVAILABLE = True
+except ImportError:
+    BEIR_AVAILABLE = False
+
 
 def load_head_weights(weight_file, num_heads_per_layer=32, num_layers=32):
     """
@@ -150,6 +157,118 @@ def match_at_k(relevances, k):
     return 1.0 if np.any(relevances > 0) else 0.0
 
 
+def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_per_query,
+                          top_k_heads=None, ks=[1, 5, 10], metric_types=None, use_baseline=False):
+    """
+    Evaluate ranking metrics using BEIR's EvaluateRetrieval.
+
+    Args:
+        features: (num_docs, num_heads) attention features
+        labels: (num_docs,) binary relevance labels
+        weights: (num_heads,) head weights (ignored if use_baseline=True)
+        query_ids: (num_docs,) query IDs for each document
+        doc_ids: (num_docs,) document IDs
+        docs_per_query: number of documents per query (int) or array of docs per query
+        top_k_heads: if set, only use top-k heads
+        ks: list of k values for @k metrics
+        metric_types: list of metric types to compute (ignored - BEIR computes all)
+        use_baseline: if True, use original document order as baseline (no reranking)
+
+    Returns:
+        metrics: dict of metric name -> value
+    """
+    if not BEIR_AVAILABLE:
+        raise ImportError("BEIR is not installed. Install with: pip install beir")
+
+    # Compute scores
+    if use_baseline:
+        # For baseline, use descending scores to preserve original order
+        scores = np.arange(len(features), 0, -1, dtype=float)
+    else:
+        scores = compute_scores(features, weights, top_k=top_k_heads)
+
+    # Convert to BEIR format
+    # qrels: {query_id: {doc_id: relevance}}
+    # results: {query_id: {doc_id: score}}
+    qrels = {}
+    results = {}
+
+    # Handle variable or fixed docs_per_query
+    if isinstance(docs_per_query, (list, np.ndarray)):
+        # Variable docs per query
+        doc_offset = 0
+        for q_idx in range(len(docs_per_query)):
+            n_docs = docs_per_query[q_idx]
+            q_scores = scores[doc_offset:doc_offset + n_docs]
+            q_labels = labels[doc_offset:doc_offset + n_docs]
+            q_doc_ids = doc_ids[doc_offset:doc_offset + n_docs]
+            q_id = str(query_ids[doc_offset])
+            doc_offset += n_docs
+
+            # Add to qrels
+            qrels[q_id] = {}
+            for doc_id, label in zip(q_doc_ids, q_labels):
+                if label >= 0:  # Skip unlabeled docs
+                    qrels[q_id][str(doc_id)] = int(label)
+
+            # Add to results
+            results[q_id] = {}
+            for doc_id, score in zip(q_doc_ids, q_scores):
+                results[q_id][str(doc_id)] = float(score)
+    else:
+        # Fixed docs per query
+        num_queries = len(labels) // docs_per_query
+        for q in range(num_queries):
+            start = q * docs_per_query
+            end = start + docs_per_query
+
+            q_scores = scores[start:end]
+            q_labels = labels[start:end]
+            q_doc_ids = doc_ids[start:end]
+            q_id = str(query_ids[start])
+
+            # Add to qrels
+            qrels[q_id] = {}
+            for doc_id, label in zip(q_doc_ids, q_labels):
+                if label >= 0:  # Skip unlabeled docs
+                    qrels[q_id][str(doc_id)] = int(label)
+
+            # Add to results
+            results[q_id] = {}
+            for doc_id, score in zip(q_doc_ids, q_scores):
+                results[q_id][str(doc_id)] = float(score)
+
+    # Use BEIR evaluator
+    evaluator = EvaluateRetrieval()
+
+    # Compute metrics at specified k values
+    ndcg, _map, recall, precision = evaluator.evaluate(qrels, results, ks)
+
+    # Format metrics to match custom evaluator output
+    metrics = {}
+    for k in ks:
+        metrics[f'NDCG@{k}'] = ndcg.get(f'NDCG@{k}', 0.0)
+        metrics[f'P@{k}'] = precision.get(f'P@{k}', 0.0)
+        # BEIR doesn't have Match@k, use Recall@k as proxy
+        metrics[f'M@{k}'] = recall.get(f'Recall@{k}', 0.0)
+
+    # Add MAP and MRR if available
+    # BEIR computes MAP and MRR at highest k value
+    map_key = f'MAP@{max(ks) if ks else 100}'
+    if map_key in _map:
+        metrics['MAP'] = _map[map_key]
+    elif 'MAP@100' in _map:
+        metrics['MAP'] = _map['MAP@100']
+
+    mrr_key = f'MRR@{max(ks) if ks else 10}'
+    if mrr_key in _map:
+        metrics['MRR'] = _map[mrr_key]
+    elif 'MRR@10' in _map:
+        metrics['MRR'] = _map['MRR@10']
+
+    return metrics
+
+
 def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=None,
                      ks=[1, 5, 10], metric_types=None, use_baseline=False):
     """
@@ -267,21 +386,23 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
 
 def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, metadata,
                                   top_k_list, ks, metric_types, docs_per_query_override,
-                                  compare_equal, include_baseline=True, verbose=True):
+                                  compare_equal, include_baseline=True, evaluator='custom', verbose=True):
     """
     Evaluate a single feature file and return results.
 
     Args:
         include_baseline: if True, compute and include baseline retriever performance
+        evaluator: 'custom' or 'beir' - which evaluation method to use
 
     Returns:
         dict with feature_file info and results list
     """
     # Load features
-    X, y, docs_per_query_arr = load_features(
+    X, y, docs_per_query_arr, query_ids, doc_ids = load_features(
         feature_file=feature_file,
         llm_name=llm_name,
-        num_samples=num_samples
+        num_samples=num_samples,
+        return_ids=True
     )
 
     # Determine docs_per_query
@@ -303,11 +424,44 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
         print(f"\n{file_label}: {X.shape[0]} docs, {num_queries} queries, "
               f"{(y == 1).sum()} positive ({100*(y == 1).mean():.1f}%)")
 
+    # Choose evaluation function based on evaluator type
+    if evaluator == 'beir':
+        if not BEIR_AVAILABLE:
+            print("Warning: BEIR not available, falling back to custom evaluator", flush=True)
+            evaluator = 'custom'
+        else:
+            eval_func = lambda **kwargs: evaluate_ranking_beir(
+                features=kwargs['features'],
+                labels=kwargs['labels'],
+                weights=kwargs['weights'],
+                query_ids=query_ids,
+                doc_ids=doc_ids,
+                docs_per_query=kwargs['docs_per_query'],
+                top_k_heads=kwargs.get('top_k_heads'),
+                ks=kwargs['ks'],
+                metric_types=kwargs.get('metric_types'),
+                use_baseline=kwargs.get('use_baseline', False)
+            )
+
+    if evaluator == 'custom':
+        eval_func = lambda **kwargs: evaluate_ranking(
+            features=kwargs['features'],
+            labels=kwargs['labels'],
+            weights=kwargs['weights'],
+            docs_per_query=kwargs['docs_per_query'],
+            top_k_heads=kwargs.get('top_k_heads'),
+            ks=kwargs['ks'],
+            metric_types=kwargs.get('metric_types'),
+            use_baseline=kwargs.get('use_baseline', False)
+        )
+
     # Evaluate baseline (original retriever ranking) first if requested
     results = []
     if include_baseline:
-        baseline_metrics = evaluate_ranking(
-            X, y, weights=None,
+        baseline_metrics = eval_func(
+            features=X,
+            labels=y,
+            weights=None,
             docs_per_query=docs_per_query,
             top_k_heads=None,
             ks=ks,
@@ -325,8 +479,10 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
     for top_k in top_k_list:
         label = f"top-{top_k}" if top_k else "all"
 
-        metrics = evaluate_ranking(
-            X, y, weights,
+        metrics = eval_func(
+            features=X,
+            labels=y,
+            weights=weights,
             docs_per_query=docs_per_query,
             top_k_heads=top_k,
             ks=ks,
@@ -345,8 +501,10 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
             top_indices = get_top_k_heads(weights, top_k)
             equal_weights[top_indices] = 1.0 / top_k
 
-            eq_metrics = evaluate_ranking(
-                X, y, equal_weights,
+            eq_metrics = eval_func(
+                features=X,
+                labels=y,
+                weights=equal_weights,
                 docs_per_query=docs_per_query,
                 top_k_heads=None,
                 ks=ks,
@@ -396,9 +554,19 @@ def main():
                         help='Also compare with equal weights on same heads')
     parser.add_argument('--no_baseline', action='store_true',
                         help='Skip computing baseline retriever performance')
+    parser.add_argument('--evaluator', type=str, default='custom', choices=['custom', 'beir'],
+                        help='Evaluation method: custom (default, built-in metrics) or beir (uses BEIR library). '
+                             'Note: BEIR requires "pip install beir" and computes all metrics (ignores --metrics flag)')
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='Output file for metrics JSON (optional, no save if not specified)')
     args = parser.parse_args()
+
+    # Check if BEIR is available when requested
+    if args.evaluator == 'beir' and not BEIR_AVAILABLE:
+        print("Error: BEIR evaluation requested but beir package is not installed.")
+        print("Install with: pip install beir")
+        print("Falling back to custom evaluator.")
+        args.evaluator = 'custom'
 
     # Normalize metric names to lowercase
     args.metrics = [m.lower() for m in args.metrics]
@@ -408,6 +576,7 @@ def main():
 
     print(f"Evaluating head weights for {args.llm}")
     print(f"Weight file: {args.weight_file}")
+    print(f"Evaluator: {args.evaluator}")
     print("=" * 70)
 
     # Load weights
@@ -447,6 +616,7 @@ def main():
             docs_per_query_override=args.docs_per_query,
             compare_equal=args.compare_equal,
             include_baseline=not args.no_baseline,
+            evaluator=args.evaluator,
             verbose=True
         )
         all_file_results.append(file_results)
@@ -455,19 +625,6 @@ def main():
     print(f"\n{'='*70}")
     print("Ranking Metrics")
     print("=" * 70)
-
-    # Build metric names based on selected metrics
-    metric_names = []
-    if 'ndcg' in args.metrics:
-        metric_names += [f'NDCG@{k}' for k in args.ks]
-    if 'p' in args.metrics:
-        metric_names += [f'P@{k}' for k in args.ks]
-    if 'm' in args.metrics:
-        metric_names += [f'M@{k}' for k in args.ks]
-    if 'map' in args.metrics:
-        metric_names.append('MAP')
-    if 'mrr' in args.metrics:
-        metric_names.append('MRR')
 
     # Collect all rows for finding max values, tracking file index
     all_rows = []
@@ -494,24 +651,54 @@ def main():
             row_idx += 1
         file_row_ranges.append((start_idx, row_idx))
 
+    # Build metric names based on selected metrics and what's actually available
+    metric_names = []
+    if 'ndcg' in args.metrics:
+        metric_names += [f'NDCG@{k}' for k in args.ks]
+    if 'p' in args.metrics:
+        metric_names += [f'P@{k}' for k in args.ks]
+    if 'm' in args.metrics:
+        metric_names += [f'M@{k}' for k in args.ks]
+    if 'map' in args.metrics:
+        metric_names.append('MAP')
+    if 'mrr' in args.metrics:
+        metric_names.append('MRR')
+
+    # Filter metric_names to only include those present in all rows
+    if all_rows:
+        available_metrics = set(all_rows[0]['metrics'].keys())
+        for row in all_rows[1:]:
+            available_metrics &= set(row['metrics'].keys())
+        metric_names = [m for m in metric_names if m in available_metrics]
+
+        if len(metric_names) == 0:
+            print("Warning: No common metrics found across all results")
+            return
+
     # Find global max value for each metric (only highlight if multiple rows)
     global_max = {}
     if len(all_rows) > 1:
         for name in metric_names:
             global_max[name] = max(row['metrics'][name] for row in all_rows)
 
-    # Find per-file max values (only if multiple files)
+    # Find per-file max and second-max values (only if multiple files)
     file_max = [{} for _ in range(len(file_row_ranges))]
+    file_second_max = [{} for _ in range(len(file_row_ranges))]
     if len(file_row_ranges) > 1:
         for file_idx, (start, end) in enumerate(file_row_ranges):
             file_rows = all_rows[start:end]
             if len(file_rows) > 1:
                 for name in metric_names:
-                    file_max[file_idx][name] = max(row['metrics'][name] for row in file_rows)
+                    values = sorted([row['metrics'][name] for row in file_rows], reverse=True)
+                    file_max[file_idx][name] = values[0]
+                    # Get second max only if there are at least 2 rows
+                    if len(values) >= 2:
+                        file_second_max[file_idx][name] = values[1]
 
     # ANSI color codes
     GREEN = '\033[92m'
-    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    YELLOW = '\033[93m'
     BOLD = '\033[1m'
     RESET = '\033[0m'
 
@@ -534,9 +721,12 @@ def main():
             # Highlight global max in green+bold
             if global_max and value == global_max[name]:
                 formatted = f"{GREEN}{BOLD}{value:<8.4f}{RESET}"
-            # Highlight per-file max in blue+bold (if not global max and multiple files)
+            # Highlight per-file max in cyan+bold (if not global max and multiple files)
             elif file_max[file_idx].get(name) is not None and value == file_max[file_idx][name]:
-                formatted = f"{BLUE}{BOLD}{value:<8.4f}{RESET}"
+                formatted = f"{CYAN}{BOLD}{value:<8.4f}{RESET}"
+            # Highlight per-file second max in yellow+bold (if not max and multiple files)
+            elif file_second_max[file_idx].get(name) is not None and value == file_second_max[file_idx][name]:
+                formatted = f"{YELLOW}{BOLD}{value:<8.4f}{RESET}"
             line += f" {formatted}"
         print(line)
 

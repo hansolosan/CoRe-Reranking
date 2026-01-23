@@ -1141,7 +1141,7 @@ def main():
             gc.collect()
             # Fall back to sequential processing
             batch_features = []
-            for q, docs in zip(batch_queries, batch_documents):
+            for q_idx, (q, docs) in enumerate(zip(batch_queries, batch_documents)):
                 try:
                     feats = extractor.extract_features(q, docs, max_doc_tokens=args.max_doc_tokens)
                     batch_features.append(feats)
@@ -1151,32 +1151,36 @@ def main():
                     gc.collect()
                     reduced_tokens = args.max_doc_tokens
                     feats = None
-                    while reduced_tokens >= 50 and feats is None:
+                    q_id = batch_query_ids[q_idx]
+                    while reduced_tokens > 0 and feats is None:
                         reduced_tokens -= 50
+                        if reduced_tokens < 0:
+                            reduced_tokens = 0
                         try:
-                            print(f"Warning: OOM for single query, retrying with max_doc_tokens={reduced_tokens}", flush=True)
+                            print(f"Warning: OOM for query '{q_id}', retrying with max_doc_tokens={reduced_tokens}", flush=True)
                             feats = extractor.extract_features(q, docs, max_doc_tokens=reduced_tokens)
                         except torch.cuda.OutOfMemoryError:
                             torch.cuda.empty_cache()
                             gc.collect()
                             continue
                         except Exception as e:
-                            print(f"Warning: Failed with reduced tokens ({reduced_tokens}): {e}", flush=True)
+                            print(f"Warning: Failed query '{q_id}' with reduced tokens ({reduced_tokens}): {e}", flush=True)
                             break
 
                     if feats is None:
-                        print(f"Warning: Could not extract features even with minimum tokens, skipping", flush=True)
+                        print(f"ERROR: Could not extract features for query '{q_id}' even with max_doc_tokens=0, skipping", flush=True)
                     batch_features.append(feats)
                     torch.cuda.empty_cache()
                 except Exception as e:
-                    print(f"Warning: Failed to extract features: {e}", flush=True)
+                    q_id = batch_query_ids[q_idx]
+                    print(f"Warning: Failed to extract features for query '{q_id}': {e}", flush=True)
                     batch_features.append(None)
                     torch.cuda.empty_cache()
         except Exception as e:
             print(f"Warning: Batch extraction failed ({e}), falling back to sequential", flush=True)
             torch.cuda.empty_cache()
             batch_features = []
-            for q, docs in zip(batch_queries, batch_documents):
+            for q_idx, (q, docs) in enumerate(zip(batch_queries, batch_documents)):
                 try:
                     feats = extractor.extract_features(q, docs, max_doc_tokens=args.max_doc_tokens)
                     batch_features.append(feats)
@@ -1186,24 +1190,29 @@ def main():
                     gc.collect()
                     reduced_tokens = args.max_doc_tokens
                     feats = None
-                    while reduced_tokens >= 50 and feats is None:
+                    q_id = batch_query_ids[q_idx]
+                    while reduced_tokens > 0 and feats is None:
                         reduced_tokens -= 50
+                        if reduced_tokens < 0:
+                            reduced_tokens = 0
                         try:
-                            print(f"Warning: OOM for single query, retrying with max_doc_tokens={reduced_tokens}", flush=True)
+                            print(f"Warning: OOM for query '{q_id}', retrying with max_doc_tokens={reduced_tokens}", flush=True)
                             feats = extractor.extract_features(q, docs, max_doc_tokens=reduced_tokens)
                         except torch.cuda.OutOfMemoryError:
                             torch.cuda.empty_cache()
                             gc.collect()
                             continue
                         except Exception as e2:
-                            print(f"Warning: Failed with reduced tokens ({reduced_tokens}): {e2}", flush=True)
+                            print(f"Warning: Failed query '{q_id}' with reduced tokens ({reduced_tokens}): {e2}", flush=True)
                             break
 
                     if feats is None:
-                        print(f"Warning: Could not extract features even with minimum tokens, skipping", flush=True)
+                        print(f"ERROR: Could not extract features for query '{q_id}' even with max_doc_tokens=0, skipping", flush=True)
                     batch_features.append(feats)
                     torch.cuda.empty_cache()
-                except Exception:
+                except Exception as ex:
+                    q_id = batch_query_ids[q_idx]
+                    print(f"Warning: Failed to extract features for query '{q_id}': {ex}", flush=True)
                     batch_features.append(None)
                     torch.cuda.empty_cache()
 
@@ -1213,14 +1222,36 @@ def main():
         valid_query_ids = []
         valid_doc_ids = []
         valid_docs_per_query = []
+        num_skipped = 0
 
         for i, feats in enumerate(batch_features):
             if feats is not None:
+                # Validate that features shape matches number of documents
+                expected_docs = len(batch_documents[i])
+                if feats.shape[0] != expected_docs:
+                    print(f"ERROR: Feature shape mismatch for query '{batch_query_ids[i]}': "
+                          f"got {feats.shape[0]} features but expected {expected_docs} documents. Skipping.", flush=True)
+                    num_skipped += 1
+                    continue
+
+                # Validate labels length matches
+                if len(batch_labels_list[i]) != expected_docs:
+                    print(f"ERROR: Label length mismatch for query '{batch_query_ids[i]}': "
+                          f"got {len(batch_labels_list[i])} labels but expected {expected_docs} documents. Skipping.", flush=True)
+                    num_skipped += 1
+                    continue
+
+                # All validations passed - add to valid results
                 valid_features.append(feats)
                 valid_labels.append(batch_labels_list[i])
-                valid_query_ids.extend([batch_query_ids[i]] * len(batch_documents[i]))
+                valid_query_ids.extend([batch_query_ids[i]] * expected_docs)
                 valid_doc_ids.extend(batch_doc_ids_list[i])
-                valid_docs_per_query.append(len(batch_documents[i]))
+                valid_docs_per_query.append(expected_docs)
+            else:
+                num_skipped += 1
+
+        if num_skipped > 0:
+            print(f"Batch summary: Successfully processed {len(valid_features)} queries, skipped {num_skipped} queries", flush=True)
 
         return valid_features, valid_labels, valid_query_ids, valid_doc_ids, valid_docs_per_query
 
@@ -1248,12 +1279,42 @@ def main():
     # Print memory statistics
     memory_stats = memory_tracker.print_stats(num_queries=len(docs_per_query))
 
+    # Report processing summary
+    num_queries_processed = len(docs_per_query)
+    num_queries_attempted = len(data)
+    num_queries_skipped = num_queries_attempted - num_queries_processed
+    if num_queries_skipped > 0:
+        print(f"\n⚠ Processing summary: {num_queries_processed}/{num_queries_attempted} queries successfully processed", flush=True)
+        print(f"  Skipped {num_queries_skipped} queries due to errors", flush=True)
+    else:
+        print(f"\n✓ All {num_queries_processed} queries processed successfully", flush=True)
+
     # Stack all features
     all_features = np.vstack(all_features)
     all_labels = np.concatenate(all_labels)
 
     print(f"\nExtracted features shape: {all_features.shape}", flush=True)
     print(f"Labels shape: {all_labels.shape}", flush=True)
+
+    # Validate alignment of all arrays
+    num_docs_from_features = all_features.shape[0]
+    num_docs_from_labels = len(all_labels)
+    num_docs_from_query_ids = len(all_query_ids)
+    num_docs_from_doc_ids = len(all_doc_ids)
+    num_docs_from_dpq = sum(docs_per_query)
+
+    if not (num_docs_from_features == num_docs_from_labels == num_docs_from_query_ids ==
+            num_docs_from_doc_ids == num_docs_from_dpq):
+        print(f"\nERROR: Data alignment mismatch detected!", flush=True)
+        print(f"  Features: {num_docs_from_features} docs", flush=True)
+        print(f"  Labels: {num_docs_from_labels} docs", flush=True)
+        print(f"  Query IDs: {num_docs_from_query_ids} docs", flush=True)
+        print(f"  Doc IDs: {num_docs_from_doc_ids} docs", flush=True)
+        print(f"  Docs per query sum: {num_docs_from_dpq} docs", flush=True)
+        print(f"\nThis indicates a bug in data handling. Please report this issue.", flush=True)
+        return
+    else:
+        print(f"✓ Data alignment validated: all arrays have {num_docs_from_features} documents", flush=True)
 
     # Print label statistics
     n_positive = int((all_labels == 1).sum())

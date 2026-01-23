@@ -32,7 +32,7 @@ def get_head_info(llm_name):
     return MODEL_CONFIGS.get(llm_name, (32, 32))
 
 
-def load_features(feature_file=None, llm_name=None, num_samples=None):
+def load_features(feature_file=None, llm_name=None, num_samples=None, return_ids=False):
     """
     Load extracted attention features from .npz file.
 
@@ -40,11 +40,14 @@ def load_features(feature_file=None, llm_name=None, num_samples=None):
         feature_file: Path to feature file (.npz). If provided, llm_name and num_samples are ignored.
         llm_name: LLM name for default path construction
         num_samples: Number of samples for default path construction
+        return_ids: If True, also return query_ids and doc_ids
 
     Returns:
         features: (n_docs, n_heads) attention features array
         labels: (n_docs,) binary labels array
         docs_per_query: (n_queries,) array of docs per query, or None if not available
+        query_ids: (n_docs,) query IDs (only if return_ids=True)
+        doc_ids: (n_docs,) document IDs (only if return_ids=True)
     """
     if feature_file is not None:
         path = Path(feature_file)
@@ -65,6 +68,29 @@ def load_features(feature_file=None, llm_name=None, num_samples=None):
     docs_per_query = None
     if 'docs_per_query' in data:
         docs_per_query = data['docs_per_query']
+
+    if return_ids:
+        # Get query_ids and doc_ids if available
+        query_ids = data.get('query_ids', None)
+        doc_ids = data.get('doc_ids', None)
+
+        # Generate default IDs if not available
+        if query_ids is None:
+            if docs_per_query is not None:
+                # Generate query IDs based on docs_per_query
+                query_ids = []
+                for q_idx, n_docs in enumerate(docs_per_query):
+                    query_ids.extend([f'q{q_idx}'] * n_docs)
+                query_ids = np.array(query_ids, dtype=object)
+            else:
+                # Assume fixed docs_per_query (e.g., 50)
+                query_ids = np.array([f'q{i // 50}' for i in range(len(labels))], dtype=object)
+
+        if doc_ids is None:
+            # Generate sequential doc IDs
+            doc_ids = np.array([f'd{i}' for i in range(len(labels))], dtype=object)
+
+        return features, labels, docs_per_query, query_ids, doc_ids
 
     return features, labels, docs_per_query
 
