@@ -1152,16 +1152,21 @@ def main():
                     reduced_tokens = args.max_doc_tokens
                     feats = None
                     q_id = batch_query_ids[q_idx]
-                    while reduced_tokens > 0 and feats is None:
+                    while reduced_tokens >= 50 and feats is None:
                         reduced_tokens -= 50
-                        if reduced_tokens < 0:
-                            reduced_tokens = 0
+                        if reduced_tokens < 10:
+                            reduced_tokens = 10
                         try:
                             print(f"Warning: OOM for query '{q_id}', retrying with max_doc_tokens={reduced_tokens}", flush=True)
                             feats = extractor.extract_features(q, docs, max_doc_tokens=reduced_tokens)
                         except torch.cuda.OutOfMemoryError:
                             torch.cuda.empty_cache()
                             gc.collect()
+                            if reduced_tokens <= 10:
+                                print(
+                                    f"ERROR: Could not extract features for query '{q_id}' even with max_doc_tokens=0, skipping",
+                                    flush=True)
+                                break
                             continue
                         except Exception as e:
                             print(f"Warning: Failed query '{q_id}' with reduced tokens ({reduced_tokens}): {e}", flush=True)
