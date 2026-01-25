@@ -1152,10 +1152,17 @@ def main():
                     reduced_tokens = args.max_doc_tokens
                     feats = None
                     q_id = batch_query_ids[q_idx]
+                    printed_problematic_warning = False
                     while reduced_tokens >= 50 and feats is None:
                         reduced_tokens -= 50
                         if reduced_tokens < 10:
                             reduced_tokens = 10
+
+                        # Print warning when going below 50 tokens (problematic query)
+                        if reduced_tokens < 50 and not printed_problematic_warning:
+                            print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens})", flush=True)
+                            printed_problematic_warning = True
+
                         try:
                             print(f"Warning: OOM for query '{q_id}', retrying with max_doc_tokens={reduced_tokens}", flush=True)
                             feats = extractor.extract_features(q, docs, max_doc_tokens=reduced_tokens)
@@ -1164,7 +1171,7 @@ def main():
                             gc.collect()
                             if reduced_tokens <= 10:
                                 print(
-                                    f"ERROR: Could not extract features for query '{q_id}' even with max_doc_tokens=0, skipping",
+                                    f"ERROR: Could not extract features for query '{q_id}' even with max_doc_tokens={reduced_tokens}, skipping",
                                     flush=True)
                                 break
                             continue
@@ -1173,7 +1180,7 @@ def main():
                             break
 
                     if feats is None:
-                        print(f"ERROR: Could not extract features for query '{q_id}' even with max_doc_tokens=0, skipping", flush=True)
+                        print(f"ERROR: Could not extract features for query '{q_id}' even with minimal tokens, skipping", flush=True)
                     batch_features.append(feats)
                     torch.cuda.empty_cache()
                 except Exception as e:
@@ -1196,10 +1203,17 @@ def main():
                     reduced_tokens = args.max_doc_tokens
                     feats = None
                     q_id = batch_query_ids[q_idx]
+                    printed_problematic_warning = False
                     while reduced_tokens > 0 and feats is None:
                         reduced_tokens -= 50
                         if reduced_tokens < 0:
                             reduced_tokens = 0
+
+                        # Print warning when going below 50 tokens (problematic query)
+                        if reduced_tokens < 50 and not printed_problematic_warning:
+                            print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens})", flush=True)
+                            printed_problematic_warning = True
+
                         try:
                             print(f"Warning: OOM for query '{q_id}', retrying with max_doc_tokens={reduced_tokens}", flush=True)
                             feats = extractor.extract_features(q, docs, max_doc_tokens=reduced_tokens)
