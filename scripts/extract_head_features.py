@@ -1136,7 +1136,7 @@ def main():
                     batch_queries, batch_documents, max_doc_tokens=args.max_doc_tokens
                 )
         except torch.cuda.OutOfMemoryError:
-            print(f"Warning: OOM for batch of {len(batch_queries)} queries, falling back to sequential", flush=True)
+            print(f"Warning: OOM for batch of {len(batch_queries)} queries, falling back to sequential (batch_size=1)", flush=True)
             torch.cuda.empty_cache()
             gc.collect()
             # Fall back to sequential processing
@@ -1153,6 +1153,9 @@ def main():
                     feats = None
                     q_id = batch_query_ids[q_idx]
                     printed_problematic_warning = False
+
+                    print(f"DEBUG: OOM in batch size 1 for query '{q_id}', num_docs={len(docs)}", flush=True)
+
                     while reduced_tokens >= 50 and feats is None:
                         reduced_tokens -= 50
                         if reduced_tokens < 10:
@@ -1160,7 +1163,39 @@ def main():
 
                         # Print warning when going below 50 tokens (problematic query)
                         if reduced_tokens < 50 and not printed_problematic_warning:
-                            print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens})", flush=True)
+                            # Compute token statistics
+                            try:
+                                # Truncate docs to current reduced_tokens
+                                truncated_docs = []
+                                for doc in docs:
+                                    text = doc.get('paragraph_text', '')
+                                    words = text.split()[:reduced_tokens]
+                                    truncated_docs.append({'paragraph_text': ' '.join(words)})
+
+                                # Prepare prompt to count tokens
+                                prompt, doc_spans, query_span = extractor.prepare_input(q, truncated_docs)
+                                prompt_tokens = len(extractor.tokenizer(prompt).input_ids)
+                                query_tokens = query_span[1] - query_span[0] + 1
+
+                                # Count document tokens
+                                total_doc_tokens = sum(end - start for start, end in doc_spans)
+
+                                # Get GPU memory stats
+                                if torch.cuda.is_available():
+                                    allocated_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+                                    reserved_gb = torch.cuda.memory_reserved() / (1024 ** 3)
+                                    total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                                    mem_info = f"GPU: {allocated_gb:.2f}GB allocated, {reserved_gb:.2f}GB reserved, {total_gb:.2f}GB total"
+                                else:
+                                    mem_info = "GPU: N/A"
+
+                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens})", flush=True)
+                                print(f"  Token stats: query={query_tokens}, docs_total={total_doc_tokens}, prompt_total={prompt_tokens}, num_docs={len(docs)}", flush=True)
+                                print(f"  Batch size: 1 (sequential processing)", flush=True)
+                                print(f"  {mem_info}", flush=True)
+                            except Exception as e:
+                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens}) [token count failed: {e}]", flush=True)
+
                             printed_problematic_warning = True
 
                         try:
@@ -1189,7 +1224,7 @@ def main():
                     batch_features.append(None)
                     torch.cuda.empty_cache()
         except Exception as e:
-            print(f"Warning: Batch extraction failed ({e}), falling back to sequential", flush=True)
+            print(f"Warning: Batch extraction failed ({e}), falling back to sequential (batch_size=1)", flush=True)
             torch.cuda.empty_cache()
             batch_features = []
             for q_idx, (q, docs) in enumerate(zip(batch_queries, batch_documents)):
@@ -1204,6 +1239,9 @@ def main():
                     feats = None
                     q_id = batch_query_ids[q_idx]
                     printed_problematic_warning = False
+
+                    print(f"DEBUG: OOM in batch size 1 (exception path) for query '{q_id}', num_docs={len(docs)}", flush=True)
+
                     while reduced_tokens > 0 and feats is None:
                         reduced_tokens -= 50
                         if reduced_tokens < 0:
@@ -1211,7 +1249,39 @@ def main():
 
                         # Print warning when going below 50 tokens (problematic query)
                         if reduced_tokens < 50 and not printed_problematic_warning:
-                            print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens})", flush=True)
+                            # Compute token statistics
+                            try:
+                                # Truncate docs to current reduced_tokens
+                                truncated_docs = []
+                                for doc in docs:
+                                    text = doc.get('paragraph_text', '')
+                                    words = text.split()[:reduced_tokens]
+                                    truncated_docs.append({'paragraph_text': ' '.join(words)})
+
+                                # Prepare prompt to count tokens
+                                prompt, doc_spans, query_span = extractor.prepare_input(q, truncated_docs)
+                                prompt_tokens = len(extractor.tokenizer(prompt).input_ids)
+                                query_tokens = query_span[1] - query_span[0] + 1
+
+                                # Count document tokens
+                                total_doc_tokens = sum(end - start for start, end in doc_spans)
+
+                                # Get GPU memory stats
+                                if torch.cuda.is_available():
+                                    allocated_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+                                    reserved_gb = torch.cuda.memory_reserved() / (1024 ** 3)
+                                    total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                                    mem_info = f"GPU: {allocated_gb:.2f}GB allocated, {reserved_gb:.2f}GB reserved, {total_gb:.2f}GB total"
+                                else:
+                                    mem_info = "GPU: N/A"
+
+                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens})", flush=True)
+                                print(f"  Token stats: query={query_tokens}, docs_total={total_doc_tokens}, prompt_total={prompt_tokens}, num_docs={len(docs)}", flush=True)
+                                print(f"  Batch size: 1 (sequential processing)", flush=True)
+                                print(f"  {mem_info}", flush=True)
+                            except Exception as e:
+                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens}) [token count failed: {e}]", flush=True)
+
                             printed_problematic_warning = True
 
                         try:
