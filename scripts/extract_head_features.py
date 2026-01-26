@@ -184,7 +184,7 @@ class HFFeatureExtractor(BaseFeatureExtractor):
     def num_head(self):
         return self._num_head
 
-    def extract_features(self, query, documents, max_doc_tokens=300):
+    def extract_features(self, query, documents, max_doc_tokens=300, max_query_tokens=None):
         """
         Extract attention features for each document from all heads.
 
@@ -192,10 +192,17 @@ class HFFeatureExtractor(BaseFeatureExtractor):
             query: query text
             documents: list of document dicts with 'paragraph_text'
             max_doc_tokens: maximum tokens per document (truncate longer docs)
+            max_query_tokens: maximum tokens for query (truncate if longer), None = no limit
 
         Returns:
             features: np.array of shape (num_docs, num_layers * num_heads)
         """
+        # Truncate query if needed
+        if max_query_tokens is not None:
+            query_words = query.split()
+            if len(query_words) > max_query_tokens:
+                query = ' '.join(query_words[:max_query_tokens])
+
         # Truncate documents
         truncated_docs = []
         for doc in documents:
@@ -255,7 +262,7 @@ class HFFeatureExtractor(BaseFeatureExtractor):
 
         return features
 
-    def extract_features_batch(self, queries, documents_list, max_doc_tokens=300):
+    def extract_features_batch(self, queries, documents_list, max_doc_tokens=300, max_query_tokens=None):
         """
         Extract attention features for a batch of queries.
 
@@ -263,6 +270,7 @@ class HFFeatureExtractor(BaseFeatureExtractor):
             queries: list of query texts
             documents_list: list of document lists (one per query)
             max_doc_tokens: maximum tokens per document
+            max_query_tokens: maximum tokens for query (truncate if longer), None = no limit
 
         Returns:
             list of features arrays, one per query
@@ -278,6 +286,12 @@ class HFFeatureExtractor(BaseFeatureExtractor):
         all_truncated_docs = []
 
         for query, documents in zip(queries, documents_list):
+            # Truncate query if needed
+            if max_query_tokens is not None:
+                query_words = query.split()
+                if len(query_words) > max_query_tokens:
+                    query = ' '.join(query_words[:max_query_tokens])
+
             # Truncate documents
             truncated_docs = []
             for doc in documents:
@@ -640,7 +654,7 @@ class VLLMFeatureExtractor(BaseFeatureExtractor):
 
         return llm_prompt, doc_spans, query_span
 
-    def extract_features(self, query, documents, max_doc_tokens=300):
+    def extract_features(self, query, documents, max_doc_tokens=300, max_query_tokens=None):
         """
         Extract attention features for each document from all heads.
 
@@ -648,10 +662,17 @@ class VLLMFeatureExtractor(BaseFeatureExtractor):
             query: query text
             documents: list of document dicts with 'paragraph_text'
             max_doc_tokens: maximum tokens per document
+            max_query_tokens: maximum tokens for query (truncate if longer), None = no limit
 
         Returns:
             features: np.array of shape (num_docs, num_layers * num_heads)
         """
+        # Truncate query if needed
+        if max_query_tokens is not None:
+            query_words = query.split()
+            if len(query_words) > max_query_tokens:
+                query = ' '.join(query_words[:max_query_tokens])
+
         # Truncate documents
         truncated_docs = []
         for doc in documents:
@@ -762,12 +783,12 @@ class VLLMFeatureExtractor(BaseFeatureExtractor):
             print("Falling back to zero features", flush=True)
             return np.zeros((num_docs, self._num_layer * self._num_head), dtype=np.float32)
 
-    def extract_features_batch(self, queries, documents_list, max_doc_tokens=300):
+    def extract_features_batch(self, queries, documents_list, max_doc_tokens=300, max_query_tokens=None):
         """Extract features for a batch of queries."""
         # Process sequentially for now - batch optimization can be added later
         results = []
         for query, documents in zip(queries, documents_list):
-            features = self.extract_features(query, documents, max_doc_tokens)
+            features = self.extract_features(query, documents, max_doc_tokens, max_query_tokens)
             results.append(features)
         return results
 
@@ -1146,34 +1167,65 @@ def main():
                     feats = extractor.extract_features(q, docs, max_doc_tokens=args.max_doc_tokens)
                     batch_features.append(feats)
                 except torch.cuda.OutOfMemoryError:
-                    # Try with reduced max_doc_tokens in increments of 50
+                    # Try with reduced max_doc_tokens and max_query_tokens
                     torch.cuda.empty_cache()
                     gc.collect()
-                    reduced_tokens = args.max_doc_tokens
+                    reduced_doc_tokens = args.max_doc_tokens
+                    reduced_query_tokens = None  # Start without query truncation
                     feats = None
                     q_id = batch_query_ids[q_idx]
                     printed_problematic_warning = False
+                    reducing_query = False
 
                     print(f"DEBUG: OOM in batch size 1 for query '{q_id}', num_docs={len(docs)}", flush=True)
 
-                    while reduced_tokens >= 50 and feats is None:
-                        reduced_tokens -= 50
-                        if reduced_tokens < 10:
-                            reduced_tokens = 10
+                    while feats is None:
+                        # Reduce document tokens first until we hit 200
+                        if reduced_doc_tokens >= 200:
+                            reduced_doc_tokens -= 50
+                            if reduced_doc_tokens < 10:
+                                reduced_doc_tokens = 10
+                        # Once doc tokens are below 200, start reducing query tokens
+                        elif not reducing_query:
+                            # Measure original query length
+                            query_token_count = len(extractor.tokenizer(q).input_ids)
+                            if query_token_count > 100:
+                                reducing_query = True
+                                reduced_query_tokens = max(100, query_token_count // 2)
+                                print(f"Info: Query '{q_id}' has {query_token_count} tokens, now reducing query to {reduced_query_tokens}", flush=True)
+                            else:
+                                # Query is already short, continue reducing docs
+                                if reduced_doc_tokens >= 50:
+                                    reduced_doc_tokens -= 50
+                                    if reduced_doc_tokens < 10:
+                                        reduced_doc_tokens = 10
+                                else:
+                                    break
+                        elif reduced_query_tokens is not None and reduced_query_tokens > 50:
+                            # Continue reducing query tokens
+                            reduced_query_tokens -= 50
+                        else:
+                            # Both doc and query at minimum
+                            break
 
-                        # Print warning when going below 50 tokens (problematic query)
-                        if reduced_tokens < 50 and not printed_problematic_warning:
+                        # Print warning when going below 50 doc tokens (problematic query)
+                        if reduced_doc_tokens < 50 and not printed_problematic_warning:
                             # Compute token statistics
                             try:
-                                # Truncate docs to current reduced_tokens
+                                # Truncate docs and query to current settings
                                 truncated_docs = []
                                 for doc in docs:
                                     text = doc.get('paragraph_text', '')
-                                    words = text.split()[:reduced_tokens]
+                                    words = text.split()[:reduced_doc_tokens]
                                     truncated_docs.append({'paragraph_text': ' '.join(words)})
 
+                                test_query = q
+                                if reduced_query_tokens is not None:
+                                    query_words = q.split()[:reduced_query_tokens]
+                                    test_query = ' '.join(query_words)
+
                                 # Prepare prompt to count tokens
-                                prompt, doc_spans, query_span = extractor.prepare_input(q, truncated_docs)
+                                prompt, doc_spans, query_span = extractor.prepare_input(test_query, truncated_docs)
                                 prompt_tokens = len(extractor.tokenizer(prompt).input_ids)
                                 query_tokens = query_span[1] - query_span[0] + 1
 
@@ -1189,29 +1241,26 @@ def main():
                                 else:
                                     mem_info = "GPU: N/A"
 
-                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens})", flush=True)
+                                query_info = f", max_query_tokens={reduced_query_tokens}" if reduced_query_tokens else ""
+                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying doc={reduced_doc_tokens}{query_info})", flush=True)
                                 print(f"  Token stats: query={query_tokens}, docs_total={total_doc_tokens}, prompt_total={prompt_tokens}, num_docs={len(docs)}", flush=True)
                                 print(f"  Batch size: 1 (sequential processing)", flush=True)
                                 print(f"  {mem_info}", flush=True)
                             except Exception as e:
-                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens}) [token count failed: {e}]", flush=True)
+                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_doc_tokens}) [token count failed: {e}]", flush=True)
 
                             printed_problematic_warning = True
 
                         try:
-                            print(f"Warning: OOM for query '{q_id}', retrying with max_doc_tokens={reduced_tokens}", flush=True)
-                            feats = extractor.extract_features(q, docs, max_doc_tokens=reduced_tokens)
+                            query_info = f", max_query_tokens={reduced_query_tokens}" if reduced_query_tokens else ""
+                            print(f"Warning: OOM for query '{q_id}', retrying with max_doc_tokens={reduced_doc_tokens}{query_info}", flush=True)
+                            feats = extractor.extract_features(q, docs, max_doc_tokens=reduced_doc_tokens, max_query_tokens=reduced_query_tokens)
                         except torch.cuda.OutOfMemoryError:
                             torch.cuda.empty_cache()
                             gc.collect()
-                            if reduced_tokens <= 10:
-                                print(
-                                    f"ERROR: Could not extract features for query '{q_id}' even with max_doc_tokens={reduced_tokens}, skipping",
-                                    flush=True)
-                                break
                             continue
                         except Exception as e:
-                            print(f"Warning: Failed query '{q_id}' with reduced tokens ({reduced_tokens}): {e}", flush=True)
+                            print(f"Warning: Failed query '{q_id}' with reduced tokens (doc={reduced_doc_tokens}, query={reduced_query_tokens}): {e}", flush=True)
                             break
 
                     if feats is None:
@@ -1232,34 +1281,65 @@ def main():
                     feats = extractor.extract_features(q, docs, max_doc_tokens=args.max_doc_tokens)
                     batch_features.append(feats)
                 except torch.cuda.OutOfMemoryError:
-                    # Try with reduced max_doc_tokens in increments of 50
+                    # Try with reduced max_doc_tokens and max_query_tokens
                     torch.cuda.empty_cache()
                     gc.collect()
-                    reduced_tokens = args.max_doc_tokens
+                    reduced_doc_tokens = args.max_doc_tokens
+                    reduced_query_tokens = None  # Start without query truncation
                     feats = None
                     q_id = batch_query_ids[q_idx]
                     printed_problematic_warning = False
+                    reducing_query = False
 
                     print(f"DEBUG: OOM in batch size 1 (exception path) for query '{q_id}', num_docs={len(docs)}", flush=True)
 
-                    while reduced_tokens > 0 and feats is None:
-                        reduced_tokens -= 50
-                        if reduced_tokens < 0:
-                            reduced_tokens = 0
+                    while feats is None:
+                        # Reduce document tokens first until we hit 200
+                        if reduced_doc_tokens >= 200:
+                            reduced_doc_tokens -= 50
+                            if reduced_doc_tokens < 10:
+                                reduced_doc_tokens = 10
+                        # Once doc tokens are below 200, start reducing query tokens
+                        elif not reducing_query:
+                            # Measure original query length
+                            query_token_count = len(extractor.tokenizer(q).input_ids)
+                            if query_token_count > 100:
+                                reducing_query = True
+                                reduced_query_tokens = max(100, query_token_count // 2)
+                                print(f"Info: Query '{q_id}' has {query_token_count} tokens, now reducing query to {reduced_query_tokens}", flush=True)
+                            else:
+                                # Query is already short, continue reducing docs
+                                if reduced_doc_tokens >= 50:
+                                    reduced_doc_tokens -= 50
+                                    if reduced_doc_tokens < 10:
+                                        reduced_doc_tokens = 10
+                                else:
+                                    break
+                        elif reduced_query_tokens is not None and reduced_query_tokens > 50:
+                            # Continue reducing query tokens
+                            reduced_query_tokens -= 50
+                        else:
+                            # Both doc and query at minimum
+                            break
 
-                        # Print warning when going below 50 tokens (problematic query)
-                        if reduced_tokens < 50 and not printed_problematic_warning:
+                        # Print warning when going below 50 doc tokens (problematic query)
+                        if reduced_doc_tokens < 50 and not printed_problematic_warning:
                             # Compute token statistics
                             try:
-                                # Truncate docs to current reduced_tokens
+                                # Truncate docs and query to current settings
                                 truncated_docs = []
                                 for doc in docs:
                                     text = doc.get('paragraph_text', '')
-                                    words = text.split()[:reduced_tokens]
+                                    words = text.split()[:reduced_doc_tokens]
                                     truncated_docs.append({'paragraph_text': ' '.join(words)})
 
+                                test_query = q
+                                if reduced_query_tokens is not None:
+                                    query_words = q.split()[:reduced_query_tokens]
+                                    test_query = ' '.join(query_words)
+
                                 # Prepare prompt to count tokens
-                                prompt, doc_spans, query_span = extractor.prepare_input(q, truncated_docs)
+                                prompt, doc_spans, query_span = extractor.prepare_input(test_query, truncated_docs)
                                 prompt_tokens = len(extractor.tokenizer(prompt).input_ids)
                                 query_tokens = query_span[1] - query_span[0] + 1
 
@@ -1275,28 +1355,30 @@ def main():
                                 else:
                                     mem_info = "GPU: N/A"
 
-                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens})", flush=True)
+                                query_info = f", max_query_tokens={reduced_query_tokens}" if reduced_query_tokens else ""
+                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying doc={reduced_doc_tokens}{query_info})", flush=True)
                                 print(f"  Token stats: query={query_tokens}, docs_total={total_doc_tokens}, prompt_total={prompt_tokens}, num_docs={len(docs)}", flush=True)
                                 print(f"  Batch size: 1 (sequential processing)", flush=True)
                                 print(f"  {mem_info}", flush=True)
                             except Exception as e:
-                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_tokens}) [token count failed: {e}]", flush=True)
+                                print(f"PROBLEMATIC: Query '{q_id}' requires max_doc_tokens < 50 (trying {reduced_doc_tokens}) [token count failed: {e}]", flush=True)
 
                             printed_problematic_warning = True
 
                         try:
-                            print(f"Warning: OOM for query '{q_id}', retrying with max_doc_tokens={reduced_tokens}", flush=True)
-                            feats = extractor.extract_features(q, docs, max_doc_tokens=reduced_tokens)
+                            query_info = f", max_query_tokens={reduced_query_tokens}" if reduced_query_tokens else ""
+                            print(f"Warning: OOM for query '{q_id}', retrying with max_doc_tokens={reduced_doc_tokens}{query_info}", flush=True)
+                            feats = extractor.extract_features(q, docs, max_doc_tokens=reduced_doc_tokens, max_query_tokens=reduced_query_tokens)
                         except torch.cuda.OutOfMemoryError:
                             torch.cuda.empty_cache()
                             gc.collect()
                             continue
                         except Exception as e2:
-                            print(f"Warning: Failed query '{q_id}' with reduced tokens ({reduced_tokens}): {e2}", flush=True)
+                            print(f"Warning: Failed query '{q_id}' with reduced tokens (doc={reduced_doc_tokens}, query={reduced_query_tokens}): {e2}", flush=True)
                             break
 
                     if feats is None:
-                        print(f"ERROR: Could not extract features for query '{q_id}' even with max_doc_tokens=0, skipping", flush=True)
+                        print(f"ERROR: Could not extract features for query '{q_id}' even with minimal tokens, skipping", flush=True)
                     batch_features.append(feats)
                     torch.cuda.empty_cache()
                 except Exception as ex:
