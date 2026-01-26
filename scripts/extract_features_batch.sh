@@ -36,6 +36,7 @@ CONDA_ENV=""
 LLM="mistral"
 QRELS=""
 MAX_DOC_TOKENS=300
+MAX_QUERY_TOKENS=""
 MAX_SAMPLES=""
 BATCH_SIZE=""
 OUTPUT_DIR=""
@@ -66,6 +67,7 @@ Required arguments:
 
 Optional arguments:
   --max_doc_tokens N    Max tokens per document (default: 300)
+  --max_query_tokens N  Max tokens per query (default: no limit, auto-reduces on OOM)
   --max_samples N       Max number of query samples to process
   --batch_size N        Batch size for inference (default: 1)
   --output_dir DIR      Output directory (default: head_data/{llm})
@@ -115,6 +117,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --max_doc_tokens)
             MAX_DOC_TOKENS="$2"
+            shift 2
+            ;;
+        --max_query_tokens)
+            MAX_QUERY_TOKENS="$2"
             shift 2
             ;;
         --max_samples)
@@ -226,6 +232,7 @@ echo "Conda environment:  $CONDA_ENV"
 echo "LLM:                $LLM"
 echo "Qrels file:         $QRELS"
 echo "Max doc tokens:     $MAX_DOC_TOKENS"
+echo "Max query tokens:   ${MAX_QUERY_TOKENS:-auto (reduces on OOM)}"
 echo "Max samples:        ${MAX_SAMPLES:-all}"
 echo "Batch size:         ${BATCH_SIZE:-1}"
 echo "Output directory:   $OUTPUT_DIR"
@@ -314,6 +321,10 @@ for INPUT_FILE in "${INPUT_FILES[@]}"; do
         CMD="$CMD --max_doc_tokens $MAX_DOC_TOKENS"
         CMD="$CMD --output_dir \"$OUTPUT_DIR\""
         CMD="$CMD --output_name \"$OUTPUT_NAME\""
+
+        if [[ -n "$MAX_QUERY_TOKENS" ]]; then
+            CMD="$CMD --max_query_tokens $MAX_QUERY_TOKENS"
+        fi
 
         if [[ -n "$MAX_SAMPLES" ]]; then
             CMD="$CMD --max_samples $MAX_SAMPLES"

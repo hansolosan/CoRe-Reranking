@@ -1010,6 +1010,8 @@ def main():
                         help='Maximum documents per query (default: all)')
     parser.add_argument('--max_doc_tokens', type=int, default=300,
                         help='Maximum tokens per document (default: 300)')
+    parser.add_argument('--max_query_tokens', type=int, default=None,
+                        help='Maximum tokens per query (default: None, auto-reduces on OOM). Queries longer than this will be truncated.')
     parser.add_argument('--prune', type=float, default=0.0,
                         help='Layer pruning ratio (default: 0.0)')
     parser.add_argument('--qrels', type=str, default=None,
@@ -1149,12 +1151,12 @@ def main():
             if len(batch_queries) == 1:
                 # Single query - use original method
                 batch_features = [extractor.extract_features(
-                    batch_queries[0], batch_documents[0], max_doc_tokens=args.max_doc_tokens
+                    batch_queries[0], batch_documents[0], max_doc_tokens=args.max_doc_tokens, max_query_tokens=args.max_query_tokens
                 )]
             else:
                 # Multiple queries - use batch method
                 batch_features = extractor.extract_features_batch(
-                    batch_queries, batch_documents, max_doc_tokens=args.max_doc_tokens
+                    batch_queries, batch_documents, max_doc_tokens=args.max_doc_tokens, max_query_tokens=args.max_query_tokens
                 )
         except torch.cuda.OutOfMemoryError:
             print(f"Warning: OOM for batch of {len(batch_queries)} queries, falling back to sequential (batch_size=1)", flush=True)
@@ -1164,7 +1166,7 @@ def main():
             batch_features = []
             for q_idx, (q, docs) in enumerate(zip(batch_queries, batch_documents)):
                 try:
-                    feats = extractor.extract_features(q, docs, max_doc_tokens=args.max_doc_tokens)
+                    feats = extractor.extract_features(q, docs, max_doc_tokens=args.max_doc_tokens, max_query_tokens=args.max_query_tokens)
                     batch_features.append(feats)
                 except torch.cuda.OutOfMemoryError:
                     # Try with reduced max_doc_tokens and max_query_tokens
@@ -1278,7 +1280,7 @@ def main():
             batch_features = []
             for q_idx, (q, docs) in enumerate(zip(batch_queries, batch_documents)):
                 try:
-                    feats = extractor.extract_features(q, docs, max_doc_tokens=args.max_doc_tokens)
+                    feats = extractor.extract_features(q, docs, max_doc_tokens=args.max_doc_tokens, max_query_tokens=args.max_query_tokens)
                     batch_features.append(feats)
                 except torch.cuda.OutOfMemoryError:
                     # Try with reduced max_doc_tokens and max_query_tokens
@@ -1549,6 +1551,7 @@ def main():
         'num_layers': extractor.num_layer,
         'num_heads': extractor.num_head,
         'max_doc_tokens': args.max_doc_tokens,
+        'max_query_tokens': args.max_query_tokens,
         'batch_size': args.batch_size,
         'prune': args.prune,
         'quantize': args.quantize if args.backend == 'hf' else None,
