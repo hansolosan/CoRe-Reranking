@@ -1,4 +1,5 @@
 import json
+import bz2
 import os
 import torch
 from tqdm import tqdm
@@ -52,7 +53,16 @@ def main():
         return
 
     # load data and retrieval heads
-    query_set = json.load(open(f'../retriever_output/{args.data}.json'))
+    data_file = f'../retriever_output/{args.data}.json'
+    data_file_bz2 = f'../retriever_output/{args.data}.json.bz2'
+    if os.path.exists(data_file):
+        query_set = json.load(open(data_file))
+    elif os.path.exists(data_file_bz2):
+        with bz2.open(data_file_bz2, 'rt', encoding='utf-8') as f:
+            query_set = json.load(f)
+    else:
+        print(f'data file not found: {data_file} or {data_file_bz2}')
+        return
     if args.reranker == 'icr':
         head_set = None
     else:

@@ -27,7 +27,7 @@ def main():
     else:
         output_file = f'../head_data/{args.llm}/{args.detector}.json'
     if os.path.exists(output_file):
-        print('run already completed')
+        print(f'run already completed: {output_file}')
         return
 
     if args.detector == 'qr':
