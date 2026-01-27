@@ -188,11 +188,14 @@ BEIR Aggregate Results
 Config               Weights    NDCG@1   NDCG@5   NDCG@10  MAP      MRR
 ----------------------------------------------------------------------
 baseline             retriever  0.3245   0.4123   0.4567   0.3890   0.4234
+oracle               gold@1     0.9756   0.9812   0.9845   0.9801   0.9823
 top-1                bce        0.3312   0.4234   0.4678   0.3956   0.4345
 top-8                bce        0.3456   0.4389   0.4823   0.4123   0.4567  <- green
 top-16               bce        0.3512   0.4445   0.4891   0.4189   0.4623  <- yellow
 ======================================================================
 ```
+
+**Note**: Oracle shows upper bound performance (gold document moved to rank 1 if present). Oracle results are excluded from color highlighting to avoid skewing comparisons between actual reranking methods.
 
 ### 11. Batch Feature Extraction (`scripts/extract_features_batch.sh`)
 Shell script for batch feature extraction across multiple datasets and k values:
@@ -217,6 +220,45 @@ Shell script for batch feature extraction across multiple datasets and k values:
 ```
 
 **Output naming:** `{output_dir}/attention_features_{dataset}_k{max_docs}.npz`
+
+### 12. Oracle Evaluation (Upper Bound Performance)
+Added oracle evaluation mode to measure theoretical upper bound performance:
+
+**What it does:**
+- Moves the first gold (relevant) document to rank 1 if it exists in the retrieved set
+- Shows the maximum possible performance achievable with perfect ranking
+- Helps quantify the performance gap between current methods and theoretical maximum
+
+**Implementation:**
+- Added `use_oracle` parameter to `evaluate_ranking()` and `evaluate_ranking_beir()`
+- Finds gold documents (label > 0) and assigns them the highest score
+- Works with both custom and BEIR evaluators
+- Supports both fixed and variable docs-per-query
+
+**Display behavior:**
+- Oracle results appear after baseline in evaluation output
+- Excluded from color highlighting to avoid skewing method comparisons
+- Sorted order: baseline → oracle → top-k methods (numerically)
+- Can be disabled with `--no_oracle` flag
+
+**Scripts updated:**
+- `scripts/rerank_with_head_weights.py` - Added oracle evaluation mode
+- `scripts/evaluate_beir_aggregate.py` - Added oracle support with `--no_oracle` flag
+
+**Example output:**
+```
+File                           Config       Weights    NDCG@1   NDCG@5   NDCG@10
+------------------------------------------------------------------------------
+attention_features_nq_k10.npz  baseline     retriever  0.3245   0.4123   0.4567
+                               oracle       gold@1     0.9812   0.9856   0.9892
+                               top-8        bce        0.3456   0.4389   0.4823  <- green
+                               top-16       bce        0.3512   0.4445   0.4891  <- yellow
+```
+
+**Interpretation:**
+- Gap between baseline (0.3245) and oracle (0.9812) shows maximum possible improvement
+- Gap between top-8 (0.3456) and oracle shows remaining headroom for improvement
+- Oracle NDCG@1 < 1.0 means some queries don't have gold docs in retrieved set
 
 ## Results (Mistral, n=1000)
 
@@ -291,8 +333,8 @@ CoRe-Reranking/
 │   ├── extract_head_features.py     # Feature extraction (+ quantization, OOM retry)
 │   ├── extract_features_batch.sh    # Batch feature extraction script
 │   ├── train_head_weights_bce.py    # Head weight training (supports BCE/InfoNCE, CV)
-│   ├── rerank_with_head_weights.py  # Ranking metrics evaluation (multi-file, baseline, BEIR)
-│   ├── evaluate_beir_aggregate.py   # BEIR aggregate evaluation (parallel)
+│   ├── rerank_with_head_weights.py  # Ranking metrics evaluation (multi-file, baseline, oracle, BEIR)
+│   ├── evaluate_beir_aggregate.py   # BEIR aggregate evaluation (parallel, oracle support)
 │   ├── analyze_head_correlations.py # Head correlation analysis (+ clustering, plots)
 │   ├── compare_features.py          # Compare feature files
 │   ├── compare_head_selection.py    # Compare methods (AUC-ROC)
