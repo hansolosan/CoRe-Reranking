@@ -52,9 +52,16 @@ Comprehensive feature extraction with multiple input/output options:
 - ✅ Custom input/output paths (`--input_file`, `-o`)
 - ✅ Quantization mode in output filename
 - ✅ Metadata JSON file with configuration details
-- ✅ OOM error handling with automatic skip and cache clearing
+- ✅ **Smart OOM retry logic** with progressive token reduction:
+  - Automatically reduces `max_doc_tokens` from 300→200→150→...→10 on CUDA OOM
+  - When doc tokens drop below 200, reduces query tokens if query > 100 tokens
+  - Query reduction: half original length, then -50 increments
+  - Temporary per-query reduction (doesn't affect other queries)
+  - Comprehensive logging for problematic queries (token stats, GPU memory)
+  - Data alignment validation when skipping queries
 - ✅ Compressed input file support (`.gz`, `.bz2`)
 - ✅ **vLLM backend support** (`--backend vllm`)
+- ✅ **Batch extraction script** (`extract_features_batch.sh`) for parallel processing
 
 **Supported backends:**
 1. HuggingFace (default): `--backend hf` - Uses transformers with custom attention modules
@@ -64,6 +71,15 @@ Comprehensive feature extraction with multiple input/output options:
 **Supported input formats:**
 1. Head detection data (`nq_core.json`): has `is_positive`/`is_negative` fields
 2. Retriever output (`retriever_output/*.json`): uses qrels for labels
+
+**OOM handling example:**
+```
+DEBUG: CUDA OOM on query 'test-free-speech-debate-ldhwbmclg-pro01a'
+  Attempting with reduced tokens: doc=250, query=607
+PROBLEMATIC: Query 'test-free-speech-debate-ldhwbmclg-pro01a' requires max_doc_tokens < 50
+  Token stats: query=1214, docs_total=236, prompt_total=1636, num_docs=20
+  GPU: 45.23GB allocated, 46.12GB reserved, 80.00GB total
+```
 
 ### 4. Modular Trainer Architecture (`scripts/trainers.py`)
 Modular trainer classes for easy loss function swapping:
@@ -99,10 +115,19 @@ Computes ranking metrics on head detection data:
 - **MRR** (Mean Reciprocal Rank)
 - Supports comparison of learned vs equal weights
 - Works with both BCE and CoRe weight files
+- ✅ **Baseline retriever evaluation** - Always computes baseline performance (original retriever ranking)
+- ✅ **Oracle evaluation** - Computes upper bound performance (moves gold doc to rank 1 if present)
+- ✅ **BEIR evaluator support** - `--evaluator beir` to use BEIR's official metrics (requires beir package)
 - ✅ Multiple feature files (`-f file1.npz file2.npz ...`)
-- ✅ Combined results table with color-coded max values (green=global, blue=per-file)
+- ✅ **Enhanced color highlighting**:
+  - Green (bold): Global maximum per metric column
+  - Cyan (bold): Per-file maximum per metric column
+  - Yellow (bold): Second-highest per file
+  - Oracle results excluded from color highlighting (not compared with actual methods)
 - ✅ Selectable metrics (`--metrics ndcg p m map mrr`)
 - ✅ Optional JSON output (`--output` / `-o`)
+- ✅ `--no_baseline` flag to skip baseline evaluation
+- ✅ `--no_oracle` flag to skip oracle (upper bound) evaluation
 - ✅ Uses shared utilities from `utils.py`
 
 ### 7. Feature Comparison (`scripts/compare_features.py`)
@@ -127,6 +152,71 @@ Analyzes correlations between attention heads relative to relevance:
 - `scripts/compare_head_selection.py` - Compare CoRe vs BCE methods, compute AUC-ROC
 - `scripts/analyze_sparsity.py` - Analyze sparsity across lambda values with plotting
 - `scripts/get_top_heads.py` - Quick inspection of top heads from CoRe or BCE
+
+### 10. BEIR Aggregate Evaluation (`scripts/evaluate_beir_aggregate.py`)
+Computes aggregate BEIR scores across all 26 BEIR datasets:
+- ✅ **Parallel execution** - Concurrent dataset evaluation with configurable workers (`--n_jobs`)
+- ✅ **Dataset validation** - Ensures all 14 main BEIR datasets present
+- ✅ **CQADupStack aggregation** - Averages 12 cqadupstack domains into single score
+- ✅ **BEIR averaging** - Final score across 15 datasets (14 main + 1 cqadupstack)
+- ✅ **Numerical sorting** - Results sorted by top-k value (baseline, then top-1, top-2, top-8...)
+- ✅ **Color highlighting** - Green (best), yellow (second-best) per metric
+- ✅ **Comprehensive output** - Individual JSON per dataset + aggregate results
+- ✅ **Flexible cqadupstack** - Warns but continues if some domains missing
+
+**BEIR datasets (15 total after aggregation):**
+- 14 main: trec-covid, nfcorpus, dbpedia-entity, scifact, scidocs, fiqa, nq, fever, climate-fever, hotpotqa, webis-touche2020, msmarco, quora, arguana
+- 1 aggregated: cqadupstack (average of android, english, gaming, gis, mathematica, physics, programmers, stats, tex, unix, webmasters, wordpress)
+
+**Usage example:**
+```bash
+python scripts/evaluate_beir_aggregate.py \
+    --llm mistral \
+    --weight_file head_data/mistral/bce_weights_lambda0.0001_n5000.json \
+    --feature_dir head_data/mistral \
+    --k 10 \
+    --top_k_heads 1 2 4 8 16 32 \
+    --n_jobs 8 \
+    --output_dir results/beir_k10
+```
+
+**Output:**
+```
+======================================================================
+BEIR Aggregate Results
+======================================================================
+Config               Weights    NDCG@1   NDCG@5   NDCG@10  MAP      MRR
+----------------------------------------------------------------------
+baseline             retriever  0.3245   0.4123   0.4567   0.3890   0.4234
+top-1                bce        0.3312   0.4234   0.4678   0.3956   0.4345
+top-8                bce        0.3456   0.4389   0.4823   0.4123   0.4567  <- green
+top-16               bce        0.3512   0.4445   0.4891   0.4189   0.4623  <- yellow
+======================================================================
+```
+
+### 11. Batch Feature Extraction (`scripts/extract_features_batch.sh`)
+Shell script for batch feature extraction across multiple datasets and k values:
+- ✅ **Parallel extraction** - Processes all combinations of input files × max_docs values
+- ✅ **Conda environment management** - Automatic activation
+- ✅ **Progress tracking** - Shows completed/skipped/failed jobs
+- ✅ **Smart skipping** - Skips existing output files
+- ✅ **OOM handling** - Supports `--max_query_tokens` for long queries
+- ✅ **Flexible configuration** - All extract_head_features.py options supported
+
+**Usage example:**
+```bash
+./scripts/extract_features_batch.sh \
+    --conda core_env \
+    --llm mistral \
+    --qrels data/qrels/nq-test.tsv \
+    --max_doc_tokens 300 \
+    --max_query_tokens 500 \
+    --max_docs 10 20 40 100 \
+    --output_dir head_data/mistral \
+    --files retriever_output/nq.json retriever_output/hotpotqa.json
+```
+
+**Output naming:** `{output_dir}/attention_features_{dataset}_k{max_docs}.npz`
 
 ## Results (Mistral, n=1000)
 
@@ -198,9 +288,11 @@ CoRe-Reranking/
 │   ├── utils.py                     # Shared utilities (feature loading, model configs, command logging)
 │   ├── trainers.py                  # Modular trainer classes (BCE, InfoNCE)
 │   ├── analyze_head_data.py         # Data analysis script
-│   ├── extract_head_features.py     # Feature extraction (+ quantization)
+│   ├── extract_head_features.py     # Feature extraction (+ quantization, OOM retry)
+│   ├── extract_features_batch.sh    # Batch feature extraction script
 │   ├── train_head_weights_bce.py    # Head weight training (supports BCE/InfoNCE, CV)
-│   ├── rerank_with_head_weights.py  # Ranking metrics evaluation (multi-file)
+│   ├── rerank_with_head_weights.py  # Ranking metrics evaluation (multi-file, baseline, BEIR)
+│   ├── evaluate_beir_aggregate.py   # BEIR aggregate evaluation (parallel)
 │   ├── analyze_head_correlations.py # Head correlation analysis (+ clustering, plots)
 │   ├── compare_features.py          # Compare feature files
 │   ├── compare_head_selection.py    # Compare methods (AUC-ROC)
@@ -235,6 +327,14 @@ CUDA_VISIBLE_DEVICES=0 python scripts/extract_head_features.py \
     --qrels path/to/qrels.tsv \
     --max_samples 100
 
+# With max query tokens to handle long queries (OOM prevention)
+CUDA_VISIBLE_DEVICES=0 python scripts/extract_head_features.py \
+    --llm mistral \
+    --input_file retriever_output/nq.json \
+    --qrels path/to/qrels.tsv \
+    --max_doc_tokens 300 \
+    --max_query_tokens 500
+
 # From compressed input file (.gz or .bz2)
 CUDA_VISIBLE_DEVICES=0 python scripts/extract_head_features.py \
     --llm mistral \
@@ -257,11 +357,23 @@ CUDA_VISIBLE_DEVICES=0 python scripts/extract_head_features.py \
 python scripts/extract_head_features.py \
     --llm mistral --backend vllm --vllm_url http://localhost:8000 \
     --max_samples 100
+
+# Batch extraction across multiple datasets and k values
+./scripts/extract_features_batch.sh \
+    --conda core_env \
+    --llm mistral \
+    --qrels data/qrels/nq-test.tsv \
+    --max_doc_tokens 300 \
+    --max_query_tokens 500 \
+    --max_docs 10 20 40 100 \
+    --output_dir head_data/mistral \
+    --files retriever_output/*.json
 ```
 
 **Output naming:** `attention_features_{input}_{n}_{quantize}.npz`
 - `attention_features_nq_core_n100.npz` (full precision)
 - `attention_features_nq_core_n100_4bit.npz` (4-bit quantized)
+- `attention_features_nq_k10.npz` (from batch script with max_docs=10)
 
 **Memory usage (Mistral-7B):**
 | Mode | VRAM |
@@ -269,6 +381,12 @@ python scripts/extract_head_features.py \
 | fp16 | ~14 GB |
 | 8bit | ~8 GB |
 | 4bit | ~5 GB |
+
+**OOM handling:**
+- Automatically reduces `max_doc_tokens` in 50-token increments on CUDA OOM
+- When doc tokens < 200, reduces query tokens if query > 100 tokens
+- Temporary per-query adjustment (doesn't affect other queries)
+- Logs problematic queries with detailed token and memory statistics
 
 ### Train Head Weights
 
@@ -310,15 +428,26 @@ python scripts/train_head_weights_bce.py --llm mistral \
 ### Evaluate Head Weights
 
 ```bash
-# Evaluate BCE weights with ranking metrics
+# Evaluate BCE weights with ranking metrics (includes baseline and oracle)
 python scripts/rerank_with_head_weights.py --llm mistral \
     --weight_file head_data/mistral/bce_weights_lambda100.0_n1000.json \
     --top_k_heads 8 16 32 --compare_equal
 
-# Compare with CoRe heads
+# Compare with CoRe heads (baseline and oracle computed automatically)
 python scripts/rerank_with_head_weights.py --llm mistral \
     --weight_file head_data/mistral/core_temp0.001_prune0.0.json \
     --top_k_heads 8
+
+# Skip baseline and oracle evaluation (reranked results only)
+python scripts/rerank_with_head_weights.py --llm mistral \
+    --weight_file head_data/mistral/bce_weights_lambda0.01_n1000.json \
+    --top_k_heads 8 --no_baseline --no_oracle
+
+# Use BEIR evaluator instead of custom evaluator
+python scripts/rerank_with_head_weights.py --llm mistral \
+    --weight_file head_data/mistral/bce_weights_lambda0.01_n1000.json \
+    -f head_data/mistral/attention_features_nq_k10.npz \
+    --top_k_heads 8 --evaluator beir
 
 # Evaluate on multiple feature files (e.g., different k values)
 python scripts/rerank_with_head_weights.py --llm mistral \
@@ -331,7 +460,28 @@ python scripts/rerank_with_head_weights.py --llm mistral \
     --weight_file head_data/mistral/bce_weights_lambda0.01_n1000.json \
     -f head_data/mistral/features_train.npz head_data/mistral/features_test.npz \
     --top_k_heads 8 32 -o results/eval_metrics.json
+
+# BEIR aggregate evaluation across all datasets
+python scripts/evaluate_beir_aggregate.py \
+    --llm mistral \
+    --weight_file head_data/mistral/bce_weights_lambda0.0001_n5000.json \
+    --feature_dir head_data/mistral \
+    --k 10 \
+    --top_k_heads 1 2 4 8 16 32 \
+    --n_jobs 8 \
+    --output_dir results/beir_k10
 ```
+
+**Evaluation modes:**
+- **Baseline**: Original retriever ranking (no reranking)
+- **Oracle**: Upper bound performance (gold document at rank 1 if present in top-k)
+- **Reranking**: Using learned weights with various top-k head configurations
+
+**Output color coding:**
+- **Green (bold)**: Global maximum per metric column
+- **Cyan (bold)**: Per-file maximum per metric column
+- **Yellow (bold)**: Second-highest per file
+- **Oracle results**: Displayed but excluded from color highlighting (not compared with actual methods)
 
 ### Compare Quantized vs Full Precision
 

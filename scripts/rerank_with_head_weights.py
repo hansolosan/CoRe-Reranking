@@ -4,6 +4,14 @@ Evaluate head weights on ranking metrics (NDCG@k, Precision@k, MAP@k).
 
 This script loads attention features and head weights, computes document scores,
 and evaluates ranking performance on the head detection data.
+
+Evaluation modes:
+- Baseline: Original retriever ranking (no reranking)
+- Oracle: Upper bound performance (gold document moved to rank 1 if present)
+- Reranking: Using learned head weights with various top-k configurations
+
+Note: Oracle results are displayed but excluded from color highlighting to avoid
+skewing comparisons between actual reranking methods.
 """
 
 import json
@@ -158,14 +166,15 @@ def match_at_k(relevances, k):
 
 
 def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_per_query,
-                          top_k_heads=None, ks=[1, 5, 10], metric_types=None, use_baseline=False):
+                          top_k_heads=None, ks=[1, 5, 10], metric_types=None, use_baseline=False,
+                          use_oracle=False):
     """
     Evaluate ranking metrics using BEIR's EvaluateRetrieval.
 
     Args:
         features: (num_docs, num_heads) attention features
         labels: (num_docs,) binary relevance labels
-        weights: (num_heads,) head weights (ignored if use_baseline=True)
+        weights: (num_heads,) head weights (ignored if use_baseline=True or use_oracle=True)
         query_ids: (num_docs,) query IDs for each document
         doc_ids: (num_docs,) document IDs
         docs_per_query: number of documents per query (int) or array of docs per query
@@ -173,6 +182,7 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
         ks: list of k values for @k metrics
         metric_types: list of metric types to compute (ignored - BEIR computes all)
         use_baseline: if True, use original document order as baseline (no reranking)
+        use_oracle: if True, move gold document to first position (upper bound)
 
     Returns:
         metrics: dict of metric name -> value
@@ -184,6 +194,10 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
     if use_baseline:
         # For baseline, use descending scores to preserve original order
         scores = np.arange(len(features), 0, -1, dtype=float)
+    elif use_oracle:
+        # For oracle, assign highest score to gold document if it exists
+        scores = np.zeros(len(features))
+        # Will be handled in ranking phase below
     else:
         scores = compute_scores(features, weights, top_k=top_k_heads)
 
@@ -199,10 +213,19 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
         doc_offset = 0
         for q_idx in range(len(docs_per_query)):
             n_docs = docs_per_query[q_idx]
-            q_scores = scores[doc_offset:doc_offset + n_docs]
+            q_scores = scores[doc_offset:doc_offset + n_docs].copy()
             q_labels = labels[doc_offset:doc_offset + n_docs]
             q_doc_ids = doc_ids[doc_offset:doc_offset + n_docs]
             q_id = str(query_ids[doc_offset])
+
+            # Oracle: if gold doc exists, give it highest score
+            if use_oracle:
+                gold_indices = np.where(q_labels > 0)[0]
+                if len(gold_indices) > 0:
+                    # Move first gold doc to top by giving it max score + 1
+                    max_score = q_scores.max() if len(q_scores) > 0 else 0
+                    q_scores[gold_indices[0]] = max_score + 1.0
+
             doc_offset += n_docs
 
             # Add to qrels
@@ -222,10 +245,18 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
             start = q * docs_per_query
             end = start + docs_per_query
 
-            q_scores = scores[start:end]
+            q_scores = scores[start:end].copy()
             q_labels = labels[start:end]
             q_doc_ids = doc_ids[start:end]
             q_id = str(query_ids[start])
+
+            # Oracle: if gold doc exists, give it highest score
+            if use_oracle:
+                gold_indices = np.where(q_labels > 0)[0]
+                if len(gold_indices) > 0:
+                    # Move first gold doc to top by giving it max score + 1
+                    max_score = q_scores.max() if len(q_scores) > 0 else 0
+                    q_scores[gold_indices[0]] = max_score + 1.0
 
             # Add to qrels
             qrels[q_id] = {}
@@ -270,20 +301,21 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
 
 
 def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=None,
-                     ks=[1, 5, 10], metric_types=None, use_baseline=False):
+                     ks=[1, 5, 10], metric_types=None, use_baseline=False, use_oracle=False):
     """
     Evaluate ranking metrics.
 
     Args:
         features: (num_docs, num_heads) attention features
         labels: (num_docs,) binary relevance labels
-        weights: (num_heads,) head weights (ignored if use_baseline=True)
+        weights: (num_heads,) head weights (ignored if use_baseline=True or use_oracle=True)
         docs_per_query: number of documents per query (int) or array of docs per query
         top_k_heads: if set, only use top-k heads
         ks: list of k values for @k metrics
         metric_types: list of metric types to compute ('ndcg', 'p', 'm', 'map', 'mrr')
                      If None, computes all metrics.
         use_baseline: if True, use original document order as baseline (no reranking)
+        use_oracle: if True, move gold document to first position (upper bound)
 
     Returns:
         metrics: dict of metric name -> value
@@ -295,6 +327,9 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
     if use_baseline:
         # For baseline, use descending scores to preserve original order
         scores = np.arange(len(features), 0, -1, dtype=float)
+    elif use_oracle:
+        # For oracle, will handle per-query below
+        scores = np.zeros(len(features))
     else:
         scores = compute_scores(features, weights, top_k=top_k_heads)
 
@@ -318,9 +353,17 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
         doc_offset = 0
         for q in range(num_queries):
             n_docs = docs_per_query[q]
-            q_scores = scores[doc_offset:doc_offset + n_docs]
+            q_scores = scores[doc_offset:doc_offset + n_docs].copy()
             q_labels = labels[doc_offset:doc_offset + n_docs]
             doc_offset += n_docs
+
+            # Oracle: if gold doc exists, give it highest score
+            if use_oracle:
+                gold_indices = np.where(q_labels > 0)[0]
+                if len(gold_indices) > 0:
+                    # Move first gold doc to top by giving it max score + 1
+                    max_score = q_scores.max() if len(q_scores) > 0 else 0
+                    q_scores[gold_indices[0]] = max_score + 1.0
 
             # Rank by score (descending)
             ranking = np.argsort(-q_scores)
@@ -346,8 +389,16 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
             start = q * docs_per_query
             end = start + docs_per_query
 
-            q_scores = scores[start:end]
+            q_scores = scores[start:end].copy()
             q_labels = labels[start:end]
+
+            # Oracle: if gold doc exists, give it highest score
+            if use_oracle:
+                gold_indices = np.where(q_labels > 0)[0]
+                if len(gold_indices) > 0:
+                    # Move first gold doc to top by giving it max score + 1
+                    max_score = q_scores.max() if len(q_scores) > 0 else 0
+                    q_scores[gold_indices[0]] = max_score + 1.0
 
             # Rank by score (descending)
             ranking = np.argsort(-q_scores)
@@ -386,12 +437,14 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
 
 def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, metadata,
                                   top_k_list, ks, metric_types, docs_per_query_override,
-                                  compare_equal, include_baseline=True, evaluator='custom', verbose=True):
+                                  compare_equal, include_baseline=True, include_oracle=True,
+                                  evaluator='custom', verbose=True):
     """
     Evaluate a single feature file and return results.
 
     Args:
         include_baseline: if True, compute and include baseline retriever performance
+        include_oracle: if True, compute and include oracle (upper bound) performance
         evaluator: 'custom' or 'beir' - which evaluation method to use
 
     Returns:
@@ -440,7 +493,8 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
                 top_k_heads=kwargs.get('top_k_heads'),
                 ks=kwargs['ks'],
                 metric_types=kwargs.get('metric_types'),
-                use_baseline=kwargs.get('use_baseline', False)
+                use_baseline=kwargs.get('use_baseline', False),
+                use_oracle=kwargs.get('use_oracle', False)
             )
 
     if evaluator == 'custom':
@@ -452,7 +506,8 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
             top_k_heads=kwargs.get('top_k_heads'),
             ks=kwargs['ks'],
             metric_types=kwargs.get('metric_types'),
-            use_baseline=kwargs.get('use_baseline', False)
+            use_baseline=kwargs.get('use_baseline', False),
+            use_oracle=kwargs.get('use_oracle', False)
         )
 
     # Evaluate baseline (original retriever ranking) first if requested
@@ -473,6 +528,25 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
             'config': 'baseline',
             'weights': 'retriever',
             'metrics': baseline_metrics
+        })
+
+    # Evaluate oracle (upper bound: gold doc at rank 1) if requested
+    if include_oracle:
+        oracle_metrics = eval_func(
+            features=X,
+            labels=y,
+            weights=None,
+            docs_per_query=docs_per_query,
+            top_k_heads=None,
+            ks=ks,
+            metric_types=metric_types,
+            use_oracle=True
+        )
+
+        results.append({
+            'config': 'oracle',
+            'weights': 'gold@1',
+            'metrics': oracle_metrics
         })
 
     # Evaluate for each top_k setting
@@ -554,6 +628,8 @@ def main():
                         help='Also compare with equal weights on same heads')
     parser.add_argument('--no_baseline', action='store_true',
                         help='Skip computing baseline retriever performance')
+    parser.add_argument('--no_oracle', action='store_true',
+                        help='Skip computing oracle (upper bound) performance')
     parser.add_argument('--evaluator', type=str, default='custom', choices=['custom', 'beir'],
                         help='Evaluation method: custom (default, built-in metrics) or beir (uses BEIR library). '
                              'Note: BEIR requires "pip install beir" and computes all metrics (ignores --metrics flag)')
@@ -616,6 +692,7 @@ def main():
             docs_per_query_override=args.docs_per_query,
             compare_equal=args.compare_equal,
             include_baseline=not args.no_baseline,
+            include_oracle=not args.no_oracle,
             evaluator=args.evaluator,
             verbose=True
         )
@@ -676,17 +753,20 @@ def main():
             return
 
     # Find global max value for each metric (only highlight if multiple rows)
+    # Exclude oracle rows from coloring
+    non_oracle_rows = [row for row in all_rows if row['config'] != 'oracle']
     global_max = {}
-    if len(all_rows) > 1:
+    if len(non_oracle_rows) > 1:
         for name in metric_names:
-            global_max[name] = max(row['metrics'][name] for row in all_rows)
+            global_max[name] = max(row['metrics'][name] for row in non_oracle_rows)
 
     # Find per-file max and second-max values (only if multiple files)
+    # Exclude oracle rows from coloring
     file_max = [{} for _ in range(len(file_row_ranges))]
     file_second_max = [{} for _ in range(len(file_row_ranges))]
     if len(file_row_ranges) > 1:
         for file_idx, (start, end) in enumerate(file_row_ranges):
-            file_rows = all_rows[start:end]
+            file_rows = [row for row in all_rows[start:end] if row['config'] != 'oracle']
             if len(file_rows) > 1:
                 for name in metric_names:
                     values = sorted([row['metrics'][name] for row in file_rows], reverse=True)
@@ -718,15 +798,17 @@ def main():
         for name in metric_names:
             value = row['metrics'][name]
             formatted = f"{value:<8.4f}"
-            # Highlight global max in green+bold
-            if global_max and value == global_max[name]:
-                formatted = f"{GREEN}{BOLD}{value:<8.4f}{RESET}"
-            # Highlight per-file max in cyan+bold (if not global max and multiple files)
-            elif file_max[file_idx].get(name) is not None and value == file_max[file_idx][name]:
-                formatted = f"{CYAN}{BOLD}{value:<8.4f}{RESET}"
-            # Highlight per-file second max in yellow+bold (if not max and multiple files)
-            elif file_second_max[file_idx].get(name) is not None and value == file_second_max[file_idx][name]:
-                formatted = f"{YELLOW}{BOLD}{value:<8.4f}{RESET}"
+            # Skip coloring for oracle rows
+            if row['config'] != 'oracle':
+                # Highlight global max in green+bold
+                if global_max and value == global_max[name]:
+                    formatted = f"{GREEN}{BOLD}{value:<8.4f}{RESET}"
+                # Highlight per-file max in cyan+bold (if not global max and multiple files)
+                elif file_max[file_idx].get(name) is not None and value == file_max[file_idx][name]:
+                    formatted = f"{CYAN}{BOLD}{value:<8.4f}{RESET}"
+                # Highlight per-file second max in yellow+bold (if not max and multiple files)
+                elif file_second_max[file_idx].get(name) is not None and value == file_second_max[file_idx][name]:
+                    formatted = f"{YELLOW}{BOLD}{value:<8.4f}{RESET}"
             line += f" {formatted}"
         print(line)
 
