@@ -71,7 +71,7 @@ class BaseFeatureExtractor(ABC):
 class HFFeatureExtractor(BaseFeatureExtractor):
     """Extract attention features using HuggingFace transformers with custom attention modules."""
 
-    def __init__(self, llm_name, prune=0.0, quantize=None):
+    def __init__(self, llm_name, prune=0.0, quantize=None, calibrate=True):
         from src.custom.custom_cache import DynamicCacheWithQuery
         self.DynamicCacheWithQuery = DynamicCacheWithQuery
         """
@@ -81,7 +81,9 @@ class HFFeatureExtractor(BaseFeatureExtractor):
             llm_name: HuggingFace model name
             prune: Layer pruning ratio (0.0 = no pruning)
             quantize: Quantization mode - None, '4bit', or '8bit'
+            calibrate: If True, subtract attention from "N/A" query (matches reranker_calib.py)
         """
+        self.calibrate = calibrate
         print(f"Loading model: {llm_name}...", flush=True)
         if quantize:
             print(f"Using {quantize} quantization", flush=True)
@@ -184,40 +186,34 @@ class HFFeatureExtractor(BaseFeatureExtractor):
     def num_head(self):
         return self._num_head
 
-    def extract_features(self, query, documents, max_doc_tokens=300, max_query_tokens=None):
+    def _extract_raw_features(self, query, truncated_docs, doc_spans, kv_cache=None, context_start_idx=0):
         """
-        Extract attention features for each document from all heads.
+        Extract raw attention features for a given query and documents.
 
         Args:
-            query: query text
-            documents: list of document dicts with 'paragraph_text'
-            max_doc_tokens: maximum tokens per document (truncate longer docs)
-            max_query_tokens: maximum tokens for query (truncate if longer), None = no limit
+            query: query text (already truncated if needed)
+            truncated_docs: list of truncated document dicts
+            doc_spans: pre-computed document spans (to ensure consistency between query and N/A)
+            kv_cache: Optional pre-computed KV cache to reuse (for calibration)
+            context_start_idx: Start index for input_ids when reusing cache
 
         Returns:
             features: np.array of shape (num_docs, num_layers * num_heads)
+            kv_cache: The KV cache (for potential reuse)
         """
-        # Truncate query if needed
-        if max_query_tokens is not None:
-            query_words = query.split()
-            if len(query_words) > max_query_tokens:
-                query = ' '.join(query_words[:max_query_tokens])
-
-        # Truncate documents
-        truncated_docs = []
-        for doc in documents:
-            text = doc.get('paragraph_text', '')
-            # Simple word-based truncation
-            words = text.split()[:max_doc_tokens]
-            truncated_docs.append({'paragraph_text': ' '.join(words)})
-
-        prompt, doc_spans, query_span = self.prepare_input(query, truncated_docs)
+        prompt, _, query_span = self.prepare_input(query, truncated_docs)
 
         # Get attention weights
         tokenized_input = self.tokenizer(prompt, return_tensors='pt').to(self.llm.device)
-        _input_ids = tokenized_input.input_ids
-        _query_indices = list(range(query_span[0], query_span[1] + 1))
-        kv_cache = self.DynamicCacheWithQuery(query_indices=_query_indices)
+        _input_ids = tokenized_input.input_ids[:, context_start_idx:]
+        _query_indices = list(range(query_span[0] - context_start_idx, query_span[1] - context_start_idx + 1))
+
+        if kv_cache is None:
+            kv_cache = self.DynamicCacheWithQuery(query_indices=_query_indices)
+        else:
+            # Reusing cache - reset query cache for new query
+            kv_cache.query_cache = []
+            kv_cache._query_indices = _query_indices
 
         with torch.no_grad():
             output = self.llm(
@@ -260,11 +256,78 @@ class HFFeatureExtractor(BaseFeatureExtractor):
         del attn_weights
         torch.cuda.empty_cache()
 
+        return features, kv_cache
+
+    def extract_features(self, query, documents, max_doc_tokens=300, max_query_tokens=None):
+        """
+        Extract attention features for each document from all heads.
+
+        If calibration is enabled (default), computes the difference between
+        attention with the actual query and attention with a content-free "N/A" query.
+        This matches the behavior of reranker_calib.py.
+
+        When calibration is enabled, the KV cache from the document portion is reused
+        between the query and "N/A" forward passes to save memory and compute.
+
+        Args:
+            query: query text
+            documents: list of document dicts with 'paragraph_text'
+            max_doc_tokens: maximum tokens per document (truncate longer docs)
+            max_query_tokens: maximum tokens for query (truncate if longer), None = no limit
+
+        Returns:
+            features: np.array of shape (num_docs, num_layers * num_heads)
+        """
+        # Truncate query if needed
+        if max_query_tokens is not None:
+            query_words = query.split()
+            if len(query_words) > max_query_tokens:
+                query = ' '.join(query_words[:max_query_tokens])
+
+        # Truncate documents
+        truncated_docs = []
+        for doc in documents:
+            text = doc.get('paragraph_text', '')
+            # Simple word-based truncation
+            words = text.split()[:max_doc_tokens]
+            truncated_docs.append({'paragraph_text': ' '.join(words)})
+
+        # Get document spans and query span (consistent for both query and N/A)
+        _, doc_spans, query_span = self.prepare_input(query, truncated_docs)
+
+        # Extract features with actual query
+        features, kv_cache = self._extract_raw_features(query, truncated_docs, doc_spans)
+
+        # If calibration is enabled, subtract features from N/A query
+        if self.calibrate:
+            # Truncate KV cache to document portion (before query)
+            # This allows reusing the document embeddings for the N/A query
+            query_start_idx = query_span[0]
+            for i in range(len(kv_cache.key_cache)):
+                kv_cache.key_cache[i] = kv_cache.key_cache[i][:, :, :query_start_idx, :]
+                kv_cache.value_cache[i] = kv_cache.value_cache[i][:, :, :query_start_idx, :]
+            kv_cache._seen_tokens = query_start_idx
+
+            # Extract features with N/A query, reusing document cache
+            features_na, _ = self._extract_raw_features('N/A', truncated_docs, doc_spans,
+                                                        kv_cache=kv_cache,
+                                                        context_start_idx=query_start_idx)
+            features = features - features_na
+
+            del kv_cache
+            torch.cuda.empty_cache()
+        else:
+            del kv_cache
+            torch.cuda.empty_cache()
+
         return features
 
     def extract_features_batch(self, queries, documents_list, max_doc_tokens=300, max_query_tokens=None):
         """
         Extract attention features for a batch of queries.
+
+        When calibration is enabled, reuses the document-portion KV cache between
+        query and N/A forward passes to save memory and compute.
 
         Args:
             queries: list of query texts
@@ -279,10 +342,12 @@ class HFFeatureExtractor(BaseFeatureExtractor):
         if batch_size == 0:
             return []
 
-        # Prepare all prompts
+        # Prepare all prompts (both query and N/A if calibrating)
         all_prompts = []
+        all_prompts_na = []
         all_doc_spans = []
         all_query_spans = []
+        all_query_spans_na = []
         all_truncated_docs = []
 
         for query, documents in zip(queries, documents_list):
@@ -305,7 +370,12 @@ class HFFeatureExtractor(BaseFeatureExtractor):
             all_doc_spans.append(doc_spans)
             all_query_spans.append(query_span)
 
-        # Tokenize all prompts with padding
+            if self.calibrate:
+                prompt_na, _, query_span_na = self.prepare_input('N/A', truncated_docs)
+                all_prompts_na.append(prompt_na)
+                all_query_spans_na.append(query_span_na)
+
+        # Tokenize all query prompts with padding
         tokenized = self.tokenizer(
             all_prompts,
             return_tensors='pt',
@@ -316,16 +386,28 @@ class HFFeatureExtractor(BaseFeatureExtractor):
         input_ids = tokenized.input_ids
         attention_mask = tokenized.attention_mask
 
-        # Adjust query spans for padding (padding is on the left by default for causal LMs)
-        # Check if padding is on left or right
+        # Also tokenize N/A prompts with padding if calibrating
+        input_ids_na = None
+        if self.calibrate:
+            tokenized_na = self.tokenizer(
+                all_prompts_na,
+                return_tensors='pt',
+                padding=True,
+                return_attention_mask=True
+            ).to(self.llm.device)
+            input_ids_na = tokenized_na.input_ids
+
+        # Adjust spans for padding (left padding for causal LMs)
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
             pad_token_id = self.tokenizer.eos_token_id
 
         adjusted_query_spans = []
+        adjusted_query_spans_na = []
         adjusted_doc_spans = []
+
         for b in range(batch_size):
-            # Count padding tokens at the start
+            # Count padding tokens at the start for query prompts
             seq = input_ids[b]
             pad_offset = 0
             for t in seq:
@@ -334,7 +416,7 @@ class HFFeatureExtractor(BaseFeatureExtractor):
                 else:
                     break
 
-            # Adjust spans
+            # Adjust spans for query
             q_start, q_end = all_query_spans[b]
             adjusted_query_spans.append((q_start + pad_offset, q_end + pad_offset))
 
@@ -343,8 +425,20 @@ class HFFeatureExtractor(BaseFeatureExtractor):
                 adj_doc_spans.append((d_start + pad_offset, d_end + pad_offset))
             adjusted_doc_spans.append(adj_doc_spans)
 
-        # Process each sample in the batch separately (due to DynamicCacheWithQuery limitation)
-        # But we can still benefit from keeping tensors on GPU
+            # Adjust spans for N/A prompts if calibrating
+            if self.calibrate:
+                seq_na = input_ids_na[b]
+                pad_offset_na = 0
+                for t in seq_na:
+                    if t == pad_token_id:
+                        pad_offset_na += 1
+                    else:
+                        break
+
+                q_start_na, q_end_na = all_query_spans_na[b]
+                adjusted_query_spans_na.append((q_start_na + pad_offset_na, q_end_na + pad_offset_na))
+
+        # Process each sample separately (due to DynamicCacheWithQuery limitation)
         all_features = []
 
         for b in range(batch_size):
@@ -391,12 +485,78 @@ class HFFeatureExtractor(BaseFeatureExtractor):
                 doc_attn = attn_weights[:, :, start:end].sum(-1)
                 features[doc_idx] = doc_attn.cpu().numpy().flatten()
 
-            all_features.append(features)
-
             del attn_weights
             torch.cuda.empty_cache()
 
+            # If calibration is enabled, compute N/A features with cache reuse
+            if self.calibrate:
+                # Truncate KV cache to document portion (before query instruction)
+                for i in range(len(kv_cache.key_cache)):
+                    kv_cache.key_cache[i] = kv_cache.key_cache[i][:, :, :q_start, :]
+                    kv_cache.value_cache[i] = kv_cache.value_cache[i][:, :, :q_start, :]
+                kv_cache._seen_tokens = q_start
+
+                # Get N/A input slice (only the query portion, after documents)
+                q_start_na, q_end_na = adjusted_query_spans_na[b]
+                na_input_slice = input_ids_na[b:b+1, q_start_na:]
+
+                # Query indices relative to the slice
+                na_query_indices = list(range(0, q_end_na - q_start_na + 1))
+
+                kv_cache.query_cache = []
+                kv_cache._query_indices = na_query_indices
+
+                with torch.no_grad():
+                    output_na = self.llm(
+                        input_ids=na_input_slice,
+                        use_cache=True,
+                        past_key_values=kv_cache,
+                        output_attentions=True
+                    )
+                kv_cache_na = output_na.past_key_values
+
+                # Total sequence length after appending N/A portion
+                na_total_end = q_start + (q_end_na - q_start_na + 1)
+
+                # Collect key and query caches for N/A
+                all_key_cache_na = []
+                all_query_cache_na = []
+                for i in range(self.num_layer):
+                    all_key_cache_na.append(kv_cache_na.key_cache[i][:, :, :na_total_end])
+                    all_query_cache_na.append(kv_cache_na.query_cache[i])
+                all_key_cache_na = torch.stack(all_key_cache_na)
+                all_query_cache_na = torch.stack(all_query_cache_na)
+
+                del output_na
+                torch.cuda.empty_cache()
+
+                # Compute N/A attention weights
+                attn_weights_na = self._get_attn_weights(all_key_cache_na, all_query_cache_na).to('cuda').squeeze(1)
+                del all_key_cache_na, all_query_cache_na
+                torch.cuda.empty_cache()
+
+                attn_weights_na = attn_weights_na.mean(-2)
+
+                # Extract N/A document-level scores (use same doc_spans - positions match)
+                features_na = np.zeros((num_docs, self.num_layer * self.num_head), dtype=np.float32)
+                for doc_idx, (start, end) in enumerate(doc_spans):
+                    doc_attn_na = attn_weights_na[:, :, start:end].sum(-1)
+                    features_na[doc_idx] = doc_attn_na.cpu().numpy().flatten()
+
+                # Subtract N/A features for calibration
+                features = features - features_na
+
+                del attn_weights_na, kv_cache_na
+                torch.cuda.empty_cache()
+
+            del kv_cache
+            torch.cuda.empty_cache()
+
+            all_features.append(features)
+
         del tokenized, input_ids, attention_mask
+        if self.calibrate:
+            del tokenized_na, input_ids_na
         torch.cuda.empty_cache()
 
         return all_features
@@ -476,7 +636,7 @@ class VLLMFeatureExtractor(BaseFeatureExtractor):
     This implementation uses hooks to capture attention outputs from the model.
     """
 
-    def __init__(self, llm_name, vllm_url=None, prune=0.0, tensor_parallel_size=1, gpu_memory_utilization=0.9):
+    def __init__(self, llm_name, vllm_url=None, prune=0.0, tensor_parallel_size=1, gpu_memory_utilization=0.9, calibrate=True):
         """
         Initialize the vLLM feature extractor.
 
@@ -486,7 +646,10 @@ class VLLMFeatureExtractor(BaseFeatureExtractor):
             prune: Layer pruning ratio (0.0 = no pruning) - only for offline mode
             tensor_parallel_size: Number of GPUs for tensor parallelism (offline mode)
             gpu_memory_utilization: Fraction of GPU memory to use (offline mode)
+            calibrate: If True, subtract attention from "N/A" query (not implemented for vLLM)
         """
+        if calibrate:
+            print("WARNING: Calibration not implemented for vLLM backend, using raw features", flush=True)
         self.llm_name = llm_name
         self.vllm_url = vllm_url
         self.prune = prune
@@ -1022,6 +1185,9 @@ def main():
                         help='Quantization mode: 4bit, 8bit, or None (default: None). Only for HuggingFace backend.')
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Number of queries to process in each batch (default: 1). Higher values may improve throughput but use more memory.')
+    parser.add_argument('--no_calibration', action='store_true',
+                        help='Disable calibration (subtracting N/A query attention). By default, calibration is enabled '
+                             'to match reranker_calib.py behavior.')
 
     # Backend selection
     parser.add_argument('--backend', type=str, default='hf', choices=['hf', 'vllm'],
@@ -1074,16 +1240,23 @@ def main():
     llm_name = LLM_NAMES[args.llm]
     print(f"Using backend: {args.backend}", flush=True)
 
+    calibrate = not args.no_calibration
+    if calibrate:
+        print("Calibration enabled: subtracting N/A query attention (use --no_calibration to disable)", flush=True)
+    else:
+        print("Calibration disabled: using raw attention features", flush=True)
+
     if args.backend == 'vllm':
         extractor = VLLMFeatureExtractor(
             llm_name,
             vllm_url=args.vllm_url,
             prune=args.prune,
             tensor_parallel_size=args.tensor_parallel_size,
-            gpu_memory_utilization=args.gpu_memory_utilization
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            calibrate=calibrate
         )
     else:
-        extractor = HFFeatureExtractor(llm_name, prune=args.prune, quantize=args.quantize)
+        extractor = HFFeatureExtractor(llm_name, prune=args.prune, quantize=args.quantize, calibrate=calibrate)
 
     print(f"Total features per document: {extractor.num_layer * extractor.num_head}", flush=True)
 
@@ -1526,7 +1699,7 @@ def main():
         output_name = output_name.replace(".npz", "")
     # Save features
     output_file = output_dir / f'{output_name}.npz'
-    np.savez(
+    np.savez_compressed(
         output_file,
         features=all_features,
         labels=all_labels,
@@ -1554,6 +1727,7 @@ def main():
         'max_query_tokens': args.max_query_tokens,
         'batch_size': args.batch_size,
         'prune': args.prune,
+        'calibrate': not args.no_calibration,
         'quantize': args.quantize if args.backend == 'hf' else None,
         'tensor_parallel_size': args.tensor_parallel_size if args.backend == 'vllm' else None,
         'gpu_memory_utilization': args.gpu_memory_utilization if args.backend == 'vllm' else None,

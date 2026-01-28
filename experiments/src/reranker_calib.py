@@ -1,14 +1,20 @@
 import math
 import transformers
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from .custom.custom_cache import DynamicCacheWithQuery
 
 class Reranker():
 
-    def __init__(self, llm_name, head_set=None, prune=0.0) -> None:
+    def __init__(self, llm_name, head_set=None, prune=0.0, batch_size=1) -> None:
+        self.batch_size = batch_size
 
         # set up the base LLM
         tokenizer = transformers.AutoTokenizer.from_pretrained(llm_name)
+        # Set up padding for batched inference
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'  # Left padding for causal LMs
         self.tokenizer = tokenizer
         config = transformers.AutoConfig.from_pretrained(llm_name)
         config.num_hidden_layers = int(config.num_hidden_layers * (1-prune)) # prune layers
@@ -93,6 +99,197 @@ class Reranker():
 
         sorted_results = torch.sort(doc_scores, descending=True)
         return sorted_results.indices.tolist(), sorted_results.values.tolist()
+
+    def rerank_batch(self, queries_and_documents):
+        """
+        Rerank multiple query-document pairs in a single batched forward pass.
+
+        Args:
+            queries_and_documents: List of (query, documents) tuples where:
+                - query: str, the query text
+                - documents: List[str], the documents to rerank
+
+        Returns:
+            List of (sorted_doc_ids, sorted_doc_scores) tuples for each query
+        """
+        batch_size = len(queries_and_documents)
+        if batch_size == 0:
+            return []
+        if batch_size == 1:
+            # Fall back to single query processing
+            query, documents = queries_and_documents[0]
+            return [self.rerank(query, documents)]
+
+        # Prepare all inputs
+        all_prompts = []
+        all_doc_spans = []
+        all_query_starts = []
+        all_query_ends = []
+        all_documents = []
+
+        for query, documents in queries_and_documents:
+            llm_prompt, doc_span, query_start_idx, query_end_idx = self.prepare_input_for_document_retrieval(query, documents)
+            all_prompts.append(llm_prompt)
+            all_doc_spans.append(doc_span)
+            all_query_starts.append(query_start_idx)
+            all_query_ends.append(query_end_idx)
+            all_documents.append(documents)
+
+        # Score documents with actual queries (batched)
+        all_tok_scores = self.score_documents_batch(
+            all_prompts, all_doc_spans, all_query_starts, all_query_ends
+        )
+
+        # Prepare content-free query prompts
+        all_prompts_na = []
+        all_doc_spans_na = []
+        all_query_starts_na = []
+        all_query_ends_na = []
+
+        for documents in all_documents:
+            llm_prompt, doc_span, query_start_idx, query_end_idx = self.prepare_input_for_document_retrieval('N/A', documents)
+            all_prompts_na.append(llm_prompt)
+            all_doc_spans_na.append(doc_span)
+            all_query_starts_na.append(query_start_idx)
+            all_query_ends_na.append(query_end_idx)
+
+        # Score documents with content-free queries (batched)
+        all_tok_scores_na = self.score_documents_batch(
+            all_prompts_na, all_doc_spans_na, all_query_starts_na, all_query_ends_na
+        )
+
+        # Compute calibrated scores for each query
+        results = []
+        for i in range(batch_size):
+            tok_scores = all_tok_scores[i]
+            tok_scores_na = all_tok_scores_na[i]
+            num_docs = len(all_documents[i])
+
+            doc_scores = torch.zeros(num_docs)
+            for j, (tok_score, tok_score_na) in enumerate(zip(tok_scores, tok_scores_na)):
+                calibrated_score = tok_score - tok_score_na
+                threshold = calibrated_score.mean() - 2 * calibrated_score.std()
+                tok_mask = (calibrated_score > threshold)
+
+                tok_score = tok_score * tok_mask
+                tok_score_na = tok_score_na * tok_mask
+                doc_scores[j] = (tok_score - tok_score_na).sum().to('cpu')
+
+            sorted_results = torch.sort(doc_scores, descending=True)
+            results.append((sorted_results.indices.tolist(), sorted_results.values.tolist()))
+
+        del all_tok_scores, all_tok_scores_na
+        torch.cuda.empty_cache()
+
+        return results
+
+    def score_documents_batch(
+            self,
+            llm_inputs,
+            doc_spans,
+            query_start_tok_idxs,
+            query_end_tok_idxs,
+        ):
+        """
+        Score documents for multiple queries in a batched forward pass.
+
+        Args:
+            llm_inputs: List of prompt strings
+            doc_spans: List of doc_span lists (one per query)
+            query_start_tok_idxs: List of query start indices
+            query_end_tok_idxs: List of query end indices
+
+        Returns:
+            List of per_doc_results lists (one per query)
+        """
+        batch_size = len(llm_inputs)
+
+        # Tokenize all inputs with padding
+        tokenized = self.tokenizer(
+            llm_inputs,
+            return_tensors='pt',
+            padding=True,
+            return_attention_mask=True
+        ).to(self.llm.device)
+
+        input_ids = tokenized.input_ids
+        attention_mask = tokenized.attention_mask
+
+        # Calculate padding offsets for each sequence (left padding)
+        seq_lengths = attention_mask.sum(dim=1).tolist()
+        max_len = input_ids.size(1)
+        padding_offsets = [max_len - seq_len for seq_len in seq_lengths]
+
+        # Adjust indices for padding
+        adjusted_query_starts = [query_start_tok_idxs[i] + padding_offsets[i] for i in range(batch_size)]
+        adjusted_query_ends = [query_end_tok_idxs[i] + padding_offsets[i] for i in range(batch_size)]
+
+        # Create cache with capture_all_queries=True for batched inference
+        # This captures all query states so we can extract per-batch-item slices later
+        kv_cache = DynamicCacheWithQuery(capture_all_queries=True)
+
+        with torch.no_grad():
+            output = self.llm(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+                past_key_values=kv_cache,
+                output_attentions=True
+            )
+        kv_cache = output.past_key_values
+
+        del tokenized, input_ids, attention_mask, output
+        torch.cuda.empty_cache()
+
+        # Process results for each query in the batch
+        all_per_doc_results = []
+
+        for b in range(batch_size):
+            # Extract key and query caches for this batch item
+            all_key_cache = []
+            all_query_cache = []
+            query_start_idx = adjusted_query_starts[b]
+            query_end_idx = adjusted_query_ends[b]
+
+            for i in range(self.num_layer):
+                # key_cache shape: [batch, num_heads, seq_len, head_dim]
+                all_key_cache.append(kv_cache.key_cache[i][b, :, :query_end_idx + 1, :])
+                # query_cache shape: [batch, num_heads, full_seq_len, head_dim]
+                # Extract only the query token positions for this batch item
+                all_query_cache.append(kv_cache.query_cache[i][b, :, query_start_idx:query_end_idx + 1, :])
+
+            # Compute attention scores
+            if self.head_set is None:
+                attn_weights = []
+                for i in range(self.num_layer):
+                    attn_weights.append((self.get_attn_all(all_key_cache[i], all_query_cache[i])).mean(-2))
+                attn_weights = torch.stack(attn_weights)
+                attn_weights = attn_weights.sum(0).sum(0)
+            else:
+                all_key_cache_stacked = torch.stack(all_key_cache)
+                all_query_cache_stacked = torch.stack(all_query_cache)
+                attn_weights = self.get_attn_head(all_key_cache_stacked, all_query_cache_stacked)
+                attn_weights = attn_weights.mean(-2).sum(0)
+
+            # Adjust doc spans for padding offset
+            adjusted_doc_span = [
+                (span[0] + padding_offsets[b], span[1] + padding_offsets[b])
+                for span in doc_spans[b]
+            ]
+
+            # Extract per-document results
+            per_doc_results = []
+            for span in adjusted_doc_span:
+                per_doc_results.append(attn_weights[span[0]:span[1] + 1].to('cpu'))
+            all_per_doc_results.append(per_doc_results)
+
+            del all_key_cache, all_query_cache, attn_weights
+            torch.cuda.empty_cache()
+
+        del kv_cache
+        torch.cuda.empty_cache()
+
+        return all_per_doc_results
 
     def score_documents(
             self,

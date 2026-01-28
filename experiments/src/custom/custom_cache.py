@@ -3,12 +3,13 @@ from transformers.cache_utils import DynamicCache
 import torch
 
 class DynamicCacheWithQuery(DynamicCache):
-    def __init__(self, query_indices=[]) -> None:
+    def __init__(self, query_indices=[], capture_all_queries=False) -> None:
         super().__init__()
         self._seen_tokens = 0  # Initialize for compatibility with newer transformers
         self.key_cache = []  # Initialize for compatibility with newer transformers
         self.value_cache = []  # Initialize for compatibility with newer transformers
         self._query_indices = query_indices # indices for query vectors to save
+        self._capture_all_queries = capture_all_queries  # If True, cache all query states (for batched inference)
         self.query_cache = []
 
     def update(

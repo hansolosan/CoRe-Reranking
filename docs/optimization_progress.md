@@ -62,6 +62,10 @@ Comprehensive feature extraction with multiple input/output options:
 - ✅ Compressed input file support (`.gz`, `.bz2`)
 - ✅ **vLLM backend support** (`--backend vllm`)
 - ✅ **Batch extraction script** (`extract_features_batch.sh`) for parallel processing
+- ✅ **Calibration support** (matches `reranker_calib.py` behavior):
+  - Subtracts attention from "N/A" query to remove query-independent patterns
+  - Enabled by default; use `--no_calibration` for raw attention features
+  - Calibration status recorded in metadata JSON
 
 **Supported backends:**
 1. HuggingFace (default): `--backend hf` - Uses transformers with custom attention modules
@@ -117,7 +121,11 @@ Computes ranking metrics on head detection data:
 - Works with both BCE and CoRe weight files
 - ✅ **Baseline retriever evaluation** - Always computes baseline performance (original retriever ranking)
 - ✅ **Oracle evaluation** - Computes upper bound performance (moves gold doc to rank 1 if present)
-- ✅ **BEIR evaluator support** - `--evaluator beir` to use BEIR's official metrics (requires beir package)
+- ✅ **BEIR evaluator support** - `--evaluator beir` (default) uses BEIR's official metrics
+- ✅ **External qrels support** - `--qrels` loads qrels file for proper NDCG computation
+  - Uses full qrels (may contain docs not in retrieved set) for accurate IDCG
+  - Validates query/doc ID matching between .npz and qrels files
+  - Shows warnings with sample IDs when mismatches detected
 - ✅ Multiple feature files (`-f file1.npz file2.npz ...`)
 - ✅ **Enhanced color highlighting**:
   - Green (bold): Global maximum per metric column
@@ -128,6 +136,7 @@ Computes ranking metrics on head detection data:
 - ✅ Optional JSON output (`--output` / `-o`)
 - ✅ `--no_baseline` flag to skip baseline evaluation
 - ✅ `--no_oracle` flag to skip oracle (upper bound) evaluation
+- ✅ **Save ranked results** - `--save_ranked` outputs ranked document lists to `reranked_results/<llm>/k<k>/`
 - ✅ Uses shared utilities from `utils.py`
 
 ### 7. Feature Comparison (`scripts/compare_features.py`)
@@ -163,6 +172,10 @@ Computes aggregate BEIR scores across all 26 BEIR datasets:
 - ✅ **Color highlighting** - Green (best), yellow (second-best) per metric
 - ✅ **Comprehensive output** - Individual JSON per dataset + aggregate results
 - ✅ **Flexible cqadupstack** - Warns but continues if some domains missing
+- ✅ **External qrels support** - `--beir_dir` loads qrels from BEIR directory structure
+  - Loads from `{beir_dir}/{corpus}/qrels/test.tsv`
+  - Supports both cqadupstack formats: `cqadupstack/android/` and `cqadupstack-android/`
+  - BEIR evaluator is now the default for proper NDCG computation
 
 **BEIR datasets (15 total after aggregation):**
 - 14 main: trec-covid, nfcorpus, dbpedia-entity, scifact, scidocs, fiqa, nq, fever, climate-fever, hotpotqa, webis-touche2020, msmarco, quora, arguana
@@ -174,6 +187,7 @@ python scripts/evaluate_beir_aggregate.py \
     --llm mistral \
     --weight_file head_data/mistral/bce_weights_lambda0.0001_n5000.json \
     --feature_dir head_data/mistral \
+    --beir_dir /path/to/beir \
     --k 10 \
     --top_k_heads 1 2 4 8 16 32 \
     --n_jobs 8 \

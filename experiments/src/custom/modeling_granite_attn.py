@@ -317,7 +317,10 @@ class GraniteAttention(nn.Module):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             if isinstance(past_key_value, DynamicCacheWithQuery):
-                query_states_to_cache = query_states[:, :, past_key_value._query_indices, :]
+                if past_key_value._capture_all_queries:
+                    query_states_to_cache = query_states  # Capture all for batched inference
+                else:
+                    query_states_to_cache = query_states[:, :, past_key_value._query_indices, :]
                 key_states, value_states = past_key_value.update(query_states_to_cache, key_states, value_states, self.layer_idx, cache_kwargs)
             else:
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -401,7 +404,10 @@ class GraniteFlashAttention2(GraniteAttention):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             if isinstance(past_key_value, DynamicCacheWithQuery):
-                query_states_to_cache = query_states[:, :, past_key_value._query_indices, :]
+                if past_key_value._capture_all_queries:
+                    query_states_to_cache = query_states  # Capture all for batched inference
+                else:
+                    query_states_to_cache = query_states[:, :, past_key_value._query_indices, :]
                 key_states, value_states = past_key_value.update(query_states_to_cache, key_states, value_states, self.layer_idx, cache_kwargs)
             else:
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)

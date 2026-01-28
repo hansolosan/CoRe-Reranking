@@ -22,6 +22,7 @@ parser.add_argument('--reranker', type=str, default='core', choices=['icr', 'qr'
 parser.add_argument('--temp', type=float, default=0.001)
 parser.add_argument('--prune', type=float, default=0.0)
 parser.add_argument('--num_head', type=int, default=8)
+parser.add_argument('--batch_size', type=int, default=1, help='Batch size for reranking multiple queries simultaneously')
 args = parser.parse_args()
 
 # best temperature found, change if needed
@@ -32,7 +33,7 @@ else:
 
 def main():
     print('-'*50)
-    print(f'reranking {args.data} top{args.top_k} with {args.llm} using {args.reranker} reranker')
+    print(f'reranking {args.data} top{args.top_k} with {args.llm} using {args.reranker} reranker (batch_size={args.batch_size})')
     if not torch.cuda.is_available():
         print('no gpu')
         return
@@ -79,10 +80,13 @@ def main():
             head_set.append(head_score_list[i][0])
 
     # initialize the reranker model
-    reranker = Reranker(llm_name[args.llm], head_set=head_set, prune=args.prune)
+    reranker = Reranker(llm_name[args.llm], head_set=head_set, prune=args.prune, batch_size=args.batch_size)
     retrieval_results = {}
 
-    # rerank
+    # rerank in batches
+    batch_queries = []
+    batch_meta = []  # store (query_idx, paragraphs) for each query in batch
+
     for i, query in enumerate(tqdm(query_set)):
         question = query['question']
         paragraphs = query['paragraphs']
@@ -96,11 +100,21 @@ def main():
             p['paragraph_text'] = ' '.join(p['paragraph_text'].split(' ')[:300])
 
         documents = [(p['paragraph_text']).strip() for p in paragraphs]
-        sorted_doc_ids, sorted_doc_scores = reranker.rerank(question, documents)
+        batch_queries.append((question, documents))
+        batch_meta.append((query['idx'], paragraphs))
 
-        retrieval_results[query['idx']] = {}
-        for _i, sorted_idx in enumerate(sorted_doc_ids):
-            retrieval_results[query['idx']][str(paragraphs[sorted_idx]['idx'])] = sorted_doc_scores[_i]
+        # Process batch when full or at the end
+        if len(batch_queries) == args.batch_size or i == len(query_set) - 1:
+            batch_results = reranker.rerank_batch(batch_queries)
+
+            for j, (sorted_doc_ids, sorted_doc_scores) in enumerate(batch_results):
+                query_idx, paragraphs = batch_meta[j]
+                retrieval_results[query_idx] = {}
+                for _i, sorted_idx in enumerate(sorted_doc_ids):
+                    retrieval_results[query_idx][str(paragraphs[sorted_idx]['idx'])] = sorted_doc_scores[_i]
+
+            batch_queries = []
+            batch_meta = []
 
     # save reranked results
     json.dump(retrieval_results, open(retrieval_output_file, 'w'), indent=2)

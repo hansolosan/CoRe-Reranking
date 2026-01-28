@@ -103,6 +103,41 @@ CQADUPSTACK_DOMAINS = [
 ALL_BEIR_DATASETS = BEIR_MAIN_DATASETS + [f'cqadupstack-{d}' for d in CQADUPSTACK_DOMAINS]
 
 
+def get_qrels_path(beir_dir: Path, dataset: str) -> Path:
+    """
+    Get the qrels file path for a BEIR dataset.
+
+    Args:
+        beir_dir: Path to BEIR data directory
+        dataset: Dataset name (e.g., 'nq', 'cqadupstack-android')
+
+    Returns:
+        Path to qrels file: {beir_dir}/{corpus}/qrels/test.tsv
+
+    For cqadupstack, tries both path formats:
+        - {beir_dir}/cqadupstack/android/qrels/test.tsv
+        - {beir_dir}/cqadupstack-android/qrels/test.tsv
+    """
+    # Handle cqadupstack subdatasets
+    if dataset.startswith('cqadupstack-'):
+        domain = dataset.split('-', 1)[1]
+
+        # Try nested format first: cqadupstack/android/qrels/test.tsv
+        nested_path = beir_dir / 'cqadupstack' / domain / 'qrels' / 'test.tsv'
+        if nested_path.exists():
+            return nested_path
+
+        # Try flat format: cqadupstack-android/qrels/test.tsv
+        flat_path = beir_dir / dataset / 'qrels' / 'test.tsv'
+        if flat_path.exists():
+            return flat_path
+
+        # Return nested path as default (will trigger warning if not found)
+        return nested_path
+    else:
+        return beir_dir / dataset / 'qrels' / 'test.tsv'
+
+
 def find_feature_files(feature_dir: Path, k: int) -> Dict[str, Path]:
     """
     Find all .npz feature files for a given k value.
@@ -168,7 +203,8 @@ def run_reranking(
     metrics: List[str],
     output_dir: Path,
     no_baseline: bool,
-    no_oracle: bool
+    no_oracle: bool,
+    qrels_file: Path = None
 ) -> Tuple[str, bool, str]:
     """
     Run rerank_with_head_weights.py for a single dataset.
@@ -190,6 +226,9 @@ def run_reranking(
         "--evaluator", evaluator,
         "--output", str(output_file)
     ]
+
+    if qrels_file is not None:
+        cmd.extend(["--qrels", str(qrels_file)])
 
     if no_baseline:
         cmd.append("--no_baseline")
@@ -382,9 +421,13 @@ Example (multiple k values):
     parser.add_argument('--metrics', type=str, nargs='+',
                         default=['ndcg', 'p', 'm', 'map', 'mrr'],
                         help='Metrics to compute: ndcg, p (precision), m (match), map, mrr (default: all)')
-    parser.add_argument('--evaluator', type=str, default='custom',
+    parser.add_argument('--evaluator', type=str, default='beir',
                         choices=['custom', 'beir'],
-                        help='Evaluator to use: custom (built-in) or beir (requires beir package) (default: custom)')
+                        help='Evaluator to use: beir (default, requires beir package) or custom (built-in)')
+    parser.add_argument('--beir_dir', type=str, default=None,
+                        help='Path to BEIR data directory containing qrels files (e.g., /path/to/beir). '
+                             'Qrels are loaded from {beir_dir}/{corpus}/qrels/test.tsv. '
+                             'Required when using --evaluator beir for proper NDCG computation.')
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Output directory for results - saves {dataset}_metrics.json and beir_aggregate.json')
     parser.add_argument('--no_baseline', action='store_true',
@@ -412,6 +455,16 @@ Example (multiple k values):
     if not weight_file.exists():
         print(f"Error: Weight file not found: {weight_file}")
         sys.exit(1)
+
+    # Resolve beir_dir if provided
+    beir_dir = Path(args.beir_dir) if args.beir_dir else None
+    if beir_dir is not None:
+        if not beir_dir.exists():
+            print(f"Error: BEIR directory not found: {beir_dir}")
+            sys.exit(1)
+        print(f"Using BEIR qrels from: {beir_dir}")
+    elif args.evaluator == 'beir':
+        print("Warning: --beir_dir not provided with --evaluator beir. NDCG will be computed using labels from .npz files only.")
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -478,8 +531,17 @@ Example (multiple k values):
         failed = []
 
         with ProcessPoolExecutor(max_workers=args.n_jobs) as executor:
-            futures = {
-                executor.submit(
+            futures = {}
+            for dataset, feature_file in dataset_files.items():
+                # Get qrels file path if beir_dir is provided
+                qrels_file = None
+                if beir_dir is not None:
+                    qrels_file = get_qrels_path(beir_dir, dataset)
+                    if not qrels_file.exists():
+                        print(f"Warning: qrels file not found for {dataset}: {qrels_file}")
+                        qrels_file = None
+
+                future = executor.submit(
                     run_reranking,
                     dataset,
                     feature_file,
@@ -491,10 +553,10 @@ Example (multiple k values):
                     args.metrics,
                     k_output_dir,
                     args.no_baseline,
-                    args.no_oracle
-                ): dataset
-                for dataset, feature_file in dataset_files.items()
-            }
+                    args.no_oracle,
+                    qrels_file
+                )
+                futures[future] = dataset
 
             for future in as_completed(futures):
                 dataset = futures[future]

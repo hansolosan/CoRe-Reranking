@@ -12,15 +12,88 @@ Evaluation modes:
 
 Note: Oracle results are displayed but excluded from color highlighting to avoid
 skewing comparisons between actual reranking methods.
+
+IMPORTANT: For proper BEIR evaluation, use --qrels to provide the external qrels file.
+The labels in the .npz file only cover documents in the retrieved set, but NDCG
+computation requires the full qrels to properly compute the ideal DCG.
 """
 
 import json
 import argparse
+import re
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
 
 from utils import log_command, load_features, get_head_info
+
+
+def load_qrels_file(qrels_path):
+    """
+    Load qrels from a file (TSV or TREC format).
+
+    Supports:
+    - TSV format: query-id, corpus-id, score (with header)
+    - TREC format: query-id, iteration, corpus-id, score (no header)
+
+    Returns:
+        qrels: dict of {query_id: {doc_id: relevance}}
+    """
+    qrels = {}
+    qrels_path = Path(qrels_path)
+
+    if not qrels_path.exists():
+        raise FileNotFoundError(f"Qrels file not found: {qrels_path}")
+
+    with open(qrels_path, 'r') as f:
+        first_line = f.readline().strip()
+        f.seek(0)  # Reset to beginning
+
+        # Check if first line is a header (TSV format)
+        if first_line.startswith('query-id') or first_line.startswith('query_id'):
+            # TSV format with header
+            import csv
+            reader = csv.DictReader(f, delimiter='\t')
+            for row in reader:
+                # Handle different column names
+                q_id = str(row.get('query-id', row.get('query_id', '')))
+                d_id = str(row.get('corpus-id', row.get('corpus_id', row.get('doc-id', row.get('doc_id', '')))))
+                score = int(row.get('score', row.get('relevance', 0)))
+
+                if q_id and d_id:
+                    if q_id not in qrels:
+                        qrels[q_id] = {}
+                    if score > 0:  # Only store positive relevance
+                        qrels[q_id][d_id] = score
+        else:
+            # TREC format (no header)
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+
+                parts = line.split()
+                if len(parts) >= 3:
+                    if len(parts) == 3:
+                        # Format: query-id, corpus-id, score
+                        q_id, d_id, score = parts
+                    else:
+                        # Format: query-id, iteration, corpus-id, score
+                        q_id, _, d_id, score = parts[:4]
+
+                    q_id = str(q_id)
+                    d_id = str(d_id)
+                    try:
+                        score = int(score)
+                    except ValueError:
+                        score = int(float(score))
+
+                    if q_id not in qrels:
+                        qrels[q_id] = {}
+                    if score > 0:  # Only store positive relevance
+                        qrels[q_id][d_id] = score
+
+    return qrels
 
 # Try to import BEIR evaluator (optional)
 try:
@@ -103,6 +176,59 @@ def compute_scores(features, weights, top_k=None):
     return features @ weights
 
 
+def compute_ranked_results(features, weights, query_ids, doc_ids, docs_per_query, top_k_heads=None):
+    """
+    Compute ranked document lists with scores.
+
+    Args:
+        features: (num_docs, num_heads) attention features
+        weights: (num_heads,) head weights
+        query_ids: (num_docs,) query IDs for each document
+        doc_ids: (num_docs,) document IDs
+        docs_per_query: number of documents per query (int) or array
+        top_k_heads: if set, only use top-k heads
+
+    Returns:
+        results: dict of {query_id: {doc_id: score, ...}} sorted by score descending
+    """
+    scores = compute_scores(features, weights, top_k=top_k_heads)
+    results = {}
+
+    if isinstance(docs_per_query, (list, np.ndarray)):
+        doc_offset = 0
+        for q_idx in range(len(docs_per_query)):
+            n_docs = docs_per_query[q_idx]
+            q_scores = scores[doc_offset:doc_offset + n_docs]
+            q_doc_ids = doc_ids[doc_offset:doc_offset + n_docs]
+            q_id = str(query_ids[doc_offset])
+            doc_offset += n_docs
+
+            # Sort by score descending
+            sorted_indices = np.argsort(-q_scores)
+            results[q_id] = {
+                str(q_doc_ids[i]): float(q_scores[i])
+                for i in sorted_indices
+            }
+    else:
+        num_queries = len(features) // docs_per_query
+        for q in range(num_queries):
+            start = q * docs_per_query
+            end = start + docs_per_query
+
+            q_scores = scores[start:end]
+            q_doc_ids = doc_ids[start:end]
+            q_id = str(query_ids[start])
+
+            # Sort by score descending
+            sorted_indices = np.argsort(-q_scores)
+            results[q_id] = {
+                str(q_doc_ids[i]): float(q_scores[i])
+                for i in sorted_indices
+            }
+
+    return results
+
+
 def dcg_at_k(relevances, k):
     """Compute DCG@k."""
     relevances = np.asarray(relevances)[:k]
@@ -167,13 +293,13 @@ def match_at_k(relevances, k):
 
 def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_per_query,
                           top_k_heads=None, ks=[1, 5, 10], metric_types=None, use_baseline=False,
-                          use_oracle=False):
+                          use_oracle=False, external_qrels=None):
     """
     Evaluate ranking metrics using BEIR's EvaluateRetrieval.
 
     Args:
         features: (num_docs, num_heads) attention features
-        labels: (num_docs,) binary relevance labels
+        labels: (num_docs,) binary relevance labels (used for oracle if external_qrels not provided)
         weights: (num_heads,) head weights (ignored if use_baseline=True or use_oracle=True)
         query_ids: (num_docs,) query IDs for each document
         doc_ids: (num_docs,) document IDs
@@ -183,6 +309,10 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
         metric_types: list of metric types to compute (ignored - BEIR computes all)
         use_baseline: if True, use original document order as baseline (no reranking)
         use_oracle: if True, move gold document to first position (upper bound)
+        external_qrels: dict of {query_id: {doc_id: relevance}} from external qrels file.
+                       If provided, uses this for evaluation instead of labels from .npz.
+                       IMPORTANT: For proper NDCG, this should contain ALL relevant docs,
+                       not just those in the retrieved set.
 
     Returns:
         metrics: dict of metric name -> value
@@ -202,9 +332,7 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
         scores = compute_scores(features, weights, top_k=top_k_heads)
 
     # Convert to BEIR format
-    # qrels: {query_id: {doc_id: relevance}}
     # results: {query_id: {doc_id: score}}
-    qrels = {}
     results = {}
 
     # Handle variable or fixed docs_per_query
@@ -218,21 +346,21 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
             q_doc_ids = doc_ids[doc_offset:doc_offset + n_docs]
             q_id = str(query_ids[doc_offset])
 
-            # Oracle: if gold doc exists, give it highest score
+            # Oracle: if gold doc exists in retrieved set, give it highest score
             if use_oracle:
-                gold_indices = np.where(q_labels > 0)[0]
+                # Check external qrels first, then fall back to labels
+                if external_qrels is not None and q_id in external_qrels:
+                    gold_indices = [i for i, d_id in enumerate(q_doc_ids)
+                                    if str(d_id) in external_qrels[q_id] and external_qrels[q_id][str(d_id)] > 0]
+                else:
+                    gold_indices = np.where(q_labels > 0)[0].tolist()
+
                 if len(gold_indices) > 0:
                     # Move first gold doc to top by giving it max score + 1
                     max_score = q_scores.max() if len(q_scores) > 0 else 0
                     q_scores[gold_indices[0]] = max_score + 1.0
 
             doc_offset += n_docs
-
-            # Add to qrels
-            qrels[q_id] = {}
-            for doc_id, label in zip(q_doc_ids, q_labels):
-                if label >= 0:  # Skip unlabeled docs
-                    qrels[q_id][str(doc_id)] = int(label)
 
             # Add to results
             results[q_id] = {}
@@ -250,24 +378,100 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
             q_doc_ids = doc_ids[start:end]
             q_id = str(query_ids[start])
 
-            # Oracle: if gold doc exists, give it highest score
+            # Oracle: if gold doc exists in retrieved set, give it highest score
             if use_oracle:
-                gold_indices = np.where(q_labels > 0)[0]
+                # Check external qrels first, then fall back to labels
+                if external_qrels is not None and q_id in external_qrels:
+                    gold_indices = [i for i, d_id in enumerate(q_doc_ids)
+                                    if str(d_id) in external_qrels[q_id] and external_qrels[q_id][str(d_id)] > 0]
+                else:
+                    gold_indices = np.where(q_labels > 0)[0].tolist()
+
                 if len(gold_indices) > 0:
                     # Move first gold doc to top by giving it max score + 1
                     max_score = q_scores.max() if len(q_scores) > 0 else 0
                     q_scores[gold_indices[0]] = max_score + 1.0
 
-            # Add to qrels
-            qrels[q_id] = {}
-            for doc_id, label in zip(q_doc_ids, q_labels):
-                if label >= 0:  # Skip unlabeled docs
-                    qrels[q_id][str(doc_id)] = int(label)
-
             # Add to results
             results[q_id] = {}
             for doc_id, score in zip(q_doc_ids, q_scores):
                 results[q_id][str(doc_id)] = float(score)
+
+    # Determine qrels to use
+    if external_qrels is not None:
+        # Use external qrels - filter to only queries we have results for
+        qrels = {q_id: external_qrels[q_id] for q_id in results.keys() if q_id in external_qrels}
+
+        # Warn if some queries don't have qrels
+        missing_qrels = set(results.keys()) - set(qrels.keys())
+        if missing_qrels:
+            # Show examples to help debug ID format mismatches
+            sample_results = list(results.keys())[:3]
+            sample_qrels = list(external_qrels.keys())[:3]
+            print(f"Warning: {len(missing_qrels)}/{len(results)} queries have no qrels")
+            print(f"  Sample query IDs from .npz: {sample_results}")
+            print(f"  Sample query IDs from qrels: {sample_qrels}")
+            if len(missing_qrels) == len(results):
+                print(f"  ERROR: No queries matched! Check that query ID formats match between .npz and qrels file.")
+
+        # Also check doc ID coverage - how many relevant docs from qrels are in our results?
+        total_relevant_in_qrels = 0
+        total_relevant_found = 0
+        sample_missing_docs = []
+        sample_found_docs = []
+        for q_id in qrels:
+            if q_id in results:
+                result_doc_ids = set(results[q_id].keys())
+                for d_id, rel in qrels[q_id].items():
+                    if rel > 0:
+                        total_relevant_in_qrels += 1
+                        if d_id in result_doc_ids:
+                            total_relevant_found += 1
+                            if len(sample_found_docs) < 3:
+                                sample_found_docs.append(d_id)
+                        elif len(sample_missing_docs) < 3:
+                            sample_missing_docs.append(d_id)
+
+        if total_relevant_in_qrels > 0:
+            coverage = 100 * total_relevant_found / total_relevant_in_qrels
+            print(f"  Relevant doc coverage: {total_relevant_found}/{total_relevant_in_qrels} ({coverage:.1f}%)")
+            if total_relevant_found == 0 and sample_missing_docs:
+                # Show sample doc IDs to help debug format mismatch
+                sample_result_docs = []
+                for q_id in list(results.keys())[:1]:
+                    sample_result_docs = list(results[q_id].keys())[:3]
+                print(f"  Sample doc IDs from .npz: {sample_result_docs}")
+                print(f"  Sample doc IDs from qrels: {sample_missing_docs}")
+                print(f"  ERROR: No docs matched! Check that doc ID formats match between .npz and qrels file.")
+    else:
+        # Build qrels from labels (only covers docs in retrieved set - may underestimate NDCG)
+        qrels = {}
+        if isinstance(docs_per_query, (list, np.ndarray)):
+            doc_offset = 0
+            for q_idx in range(len(docs_per_query)):
+                n_docs = docs_per_query[q_idx]
+                q_labels = labels[doc_offset:doc_offset + n_docs]
+                q_doc_ids = doc_ids[doc_offset:doc_offset + n_docs]
+                q_id = str(query_ids[doc_offset])
+                doc_offset += n_docs
+
+                qrels[q_id] = {}
+                for doc_id, label in zip(q_doc_ids, q_labels):
+                    if label > 0:  # Only positive labels
+                        qrels[q_id][str(doc_id)] = int(label)
+        else:
+            num_queries = len(labels) // docs_per_query
+            for q in range(num_queries):
+                start = q * docs_per_query
+                end = start + docs_per_query
+                q_labels = labels[start:end]
+                q_doc_ids = doc_ids[start:end]
+                q_id = str(query_ids[start])
+
+                qrels[q_id] = {}
+                for doc_id, label in zip(q_doc_ids, q_labels):
+                    if label > 0:  # Only positive labels
+                        qrels[q_id][str(doc_id)] = int(label)
 
     # Use BEIR evaluator
     evaluator = EvaluateRetrieval()
@@ -438,7 +642,8 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
 def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, metadata,
                                   top_k_list, ks, metric_types, docs_per_query_override,
                                   compare_equal, include_baseline=True, include_oracle=True,
-                                  evaluator='custom', verbose=True):
+                                  evaluator='custom', external_qrels=None, verbose=True,
+                                  return_ranked_results=False):
     """
     Evaluate a single feature file and return results.
 
@@ -446,9 +651,12 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
         include_baseline: if True, compute and include baseline retriever performance
         include_oracle: if True, compute and include oracle (upper bound) performance
         evaluator: 'custom' or 'beir' - which evaluation method to use
+        external_qrels: dict of {query_id: {doc_id: relevance}} from external qrels file.
+                       If provided with evaluator='beir', uses this for proper NDCG computation.
+        return_ranked_results: if True, also return ranked document lists with scores
 
     Returns:
-        dict with feature_file info and results list
+        dict with feature_file info, results list, and optionally ranked_results
     """
     # Load features
     X, y, docs_per_query_arr, query_ids, doc_ids = load_features(
@@ -494,7 +702,8 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
                 ks=kwargs['ks'],
                 metric_types=kwargs.get('metric_types'),
                 use_baseline=kwargs.get('use_baseline', False),
-                use_oracle=kwargs.get('use_oracle', False)
+                use_oracle=kwargs.get('use_oracle', False),
+                external_qrels=external_qrels
             )
 
     if evaluator == 'custom':
@@ -591,13 +800,28 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
                 'metrics': eq_metrics
             })
 
+    # Compute ranked results if requested
+    ranked_results = None
+    if return_ranked_results:
+        # Use first top_k setting (or all heads if None)
+        top_k = top_k_list[0] if top_k_list else None
+        ranked_results = compute_ranked_results(
+            features=X,
+            weights=weights,
+            query_ids=query_ids,
+            doc_ids=doc_ids,
+            docs_per_query=docs_per_query,
+            top_k_heads=top_k
+        )
+
     return {
         'feature_file': str(feature_file) if feature_file else None,
         'num_docs': X.shape[0],
         'num_queries': num_queries,
         'docs_per_query': docs_info,
         'positive_docs': int((y == 1).sum()),
-        'results': results
+        'results': results,
+        'ranked_results': ranked_results
     }
 
 
@@ -630,11 +854,18 @@ def main():
                         help='Skip computing baseline retriever performance')
     parser.add_argument('--no_oracle', action='store_true',
                         help='Skip computing oracle (upper bound) performance')
-    parser.add_argument('--evaluator', type=str, default='custom', choices=['custom', 'beir'],
-                        help='Evaluation method: custom (default, built-in metrics) or beir (uses BEIR library). '
-                             'Note: BEIR requires "pip install beir" and computes all metrics (ignores --metrics flag)')
+    parser.add_argument('--evaluator', type=str, default='beir', choices=['custom', 'beir'],
+                        help='Evaluation method: beir (default, uses BEIR library) or custom (built-in metrics). '
+                             'Note: BEIR requires "pip install beir". Use --qrels to provide external qrels for proper NDCG.')
+    parser.add_argument('--qrels', type=str, default=None,
+                        help='Path to external qrels file (TSV or TREC format). IMPORTANT: For proper NDCG '
+                             'computation with BEIR evaluator, provide the full qrels file which may contain '
+                             'relevant documents not in the retrieved set. Without this, NDCG is computed only '
+                             'against docs in the .npz file which may underestimate the true score.')
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='Output file for metrics JSON (optional, no save if not specified)')
+    parser.add_argument('--save_ranked', action='store_true',
+                        help='Save ranked document lists with scores to reranked_results/<llm>/k<k>/')
     args = parser.parse_args()
 
     # Check if BEIR is available when requested
@@ -675,6 +906,17 @@ def main():
     else:
         feature_files = args.feature_file
 
+    # Load external qrels if provided
+    external_qrels = None
+    if args.qrels:
+        print(f"\nLoading external qrels from {args.qrels}...")
+        external_qrels = load_qrels_file(args.qrels)
+        total_relevant = sum(len(docs) for docs in external_qrels.values())
+        print(f"Loaded qrels: {len(external_qrels)} queries, {total_relevant} total relevant docs")
+
+        if args.evaluator == 'custom':
+            print("Warning: External qrels are ignored with --evaluator custom. Use --evaluator beir (default) to use them.")
+
     # Evaluate each feature file
     print(f"\nEvaluating on {len(feature_files)} feature file(s)...")
     all_file_results = []
@@ -694,9 +936,42 @@ def main():
             include_baseline=not args.no_baseline,
             include_oracle=not args.no_oracle,
             evaluator=args.evaluator,
-            verbose=True
+            external_qrels=external_qrels,
+            verbose=True,
+            return_ranked_results=args.save_ranked
         )
         all_file_results.append(file_results)
+
+        # Save ranked results if requested
+        if args.save_ranked and file_results.get('ranked_results'):
+            # Determine k from feature file name or docs_per_query
+            if feature_file:
+                # Try to extract k from filename like "attention_features_nq_k40.npz"
+                import re
+                k_match = re.search(r'_k(\d+)', str(feature_file))
+                if k_match:
+                    k_value = k_match.group(1)
+                else:
+                    # Fall back to docs_per_query
+                    k_value = str(file_results.get('docs_per_query', 'unknown')).split()[0]
+            else:
+                k_value = 'unknown'
+
+            # Create output directory
+            output_dir = Path('reranked_results') / args.llm / f'k{k_value}'
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Determine output filename from input feature file
+            if feature_file:
+                input_stem = Path(feature_file).stem
+            else:
+                input_stem = f'features_n{args.num_samples}'
+
+            output_file = output_dir / f'{input_stem}_reranked.json'
+
+            with open(output_file, 'w') as f:
+                json.dump(file_results['ranked_results'], f, indent=2)
+            print(f"Saved ranked results to {output_file}")
 
     # Print combined results table
     print(f"\n{'='*70}")
@@ -819,6 +1094,8 @@ def main():
             'weight_file': str(args.weight_file),
             'llm': args.llm,
             'num_samples': args.num_samples,
+            'qrels_file': args.qrels,
+            'evaluator': args.evaluator,
             'feature_files': [f['feature_file'] for f in all_file_results],
             'file_results': all_file_results
         }
