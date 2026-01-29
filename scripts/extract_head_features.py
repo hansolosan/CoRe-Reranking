@@ -289,7 +289,7 @@ class HFFeatureExtractor(BaseFeatureExtractor):
         for doc in documents:
             text = doc.get('paragraph_text', '')
             # Simple word-based truncation
-            words = text.split()[:max_doc_tokens]
+            words = text.split()[:max_doc_tokens] if isinstance(text, str) else []
             truncated_docs.append({'paragraph_text': ' '.join(words)})
 
         # Get document spans and query span (consistent for both query and N/A)

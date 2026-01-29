@@ -368,6 +368,196 @@ def compute_beir_average(dataset_results: Dict[str, Dict[str, Dict[str, float]]]
     return beir_avg
 
 
+def print_corpus_breakdown(
+    dataset_results: Dict[str, Dict[str, Dict[str, float]]],
+    beir_avg: Dict[str, Dict[str, float]],
+    display_metrics: List[str],
+    k_val: int,
+    no_baseline: bool = False,
+    no_oracle: bool = False
+):
+    """
+    Print per-corpus breakdown for baseline, oracle, and best performing config.
+
+    Args:
+        dataset_results: dict mapping dataset -> config -> metrics
+        beir_avg: dict mapping config -> metrics (BEIR average)
+        display_metrics: list of metric names to display (e.g., ['ndcg@10'])
+        k_val: k value for display
+        no_baseline: whether baseline was skipped
+        no_oracle: whether oracle was skipped
+    """
+    # ANSI color codes
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
+
+    # Aggregate cqadupstack for display
+    cqadupstack_agg = aggregate_cqadupstack(dataset_results)
+
+    # Build display datasets: main + cqadupstack (aggregated)
+    display_results = {d: dataset_results[d] for d in BEIR_MAIN_DATASETS if d in dataset_results}
+    if cqadupstack_agg:
+        display_results['cqadupstack'] = cqadupstack_agg
+
+    # Order datasets: main datasets alphabetically, then cqadupstack at the end
+    ordered_datasets = sorted([d for d in display_results.keys() if d != 'cqadupstack'])
+    if 'cqadupstack' in display_results:
+        ordered_datasets.append('cqadupstack')
+
+    # Find configs to display
+    configs_to_show = []
+
+    # Find baseline config
+    baseline_config = None
+    for config_key in beir_avg.keys():
+        if config_key.split('_', 1)[0] == 'baseline':
+            baseline_config = config_key
+            break
+
+    # Find oracle config
+    oracle_config = None
+    for config_key in beir_avg.keys():
+        if config_key.split('_', 1)[0] == 'oracle':
+            oracle_config = config_key
+            break
+
+    # Find best non-baseline, non-oracle config by first display metric (typically ndcg@10)
+    primary_metric = display_metrics[0] if display_metrics else 'ndcg@10'
+    best_config = None
+    best_value = -float('inf')
+
+    for config_key, metrics in beir_avg.items():
+        config_name = config_key.split('_', 1)[0]
+        if config_name in ('baseline', 'oracle'):
+            continue
+        if primary_metric in metrics and metrics[primary_metric] > best_value:
+            best_value = metrics[primary_metric]
+            best_config = config_key
+
+    # Build list of configs to show
+    if not no_baseline and baseline_config:
+        configs_to_show.append(('baseline', baseline_config))
+    if not no_oracle and oracle_config:
+        configs_to_show.append(('oracle', oracle_config))
+    if best_config:
+        # Extract display name (e.g., "top-8" from "top-8_bce")
+        best_name = best_config.split('_', 1)[0]
+        configs_to_show.append((f'best ({best_name})', best_config))
+
+    if not configs_to_show:
+        print("No configs available for corpus breakdown")
+        return
+
+    # Validate display metrics exist
+    available_metrics = set()
+    for config_key in beir_avg.keys():
+        available_metrics.update(beir_avg[config_key].keys())
+
+    valid_display_metrics = [m for m in display_metrics if m in available_metrics]
+    if not valid_display_metrics:
+        print(f"Warning: None of the requested metrics {display_metrics} found. Available: {sorted(available_metrics)}")
+        return
+
+    # Print header
+    print(f"\n{'='*70}")
+    print(f"Per-Corpus Breakdown (k={k_val} documents)")
+    print(f"{'='*70}")
+
+    # Calculate column widths
+    dataset_col_width = max(len(d) for d in ordered_datasets) + 2
+    metric_col_width = 10
+
+    # Header row with config names
+    header = f"{'Dataset':<{dataset_col_width}}"
+    for display_name, _ in configs_to_show:
+        for metric in valid_display_metrics:
+            col_header = f"{display_name}" if len(valid_display_metrics) == 1 else f"{display_name}:{metric}"
+            header += f" {col_header:>{metric_col_width}}"
+    print(header)
+    print("-" * len(header.replace('\033[', '').replace('m', '')))  # Approximate line width
+
+    # Find max values per metric column for highlighting (exclude oracle)
+    max_per_column = {}
+    for display_name, config_key in configs_to_show:
+        if display_name == 'oracle':
+            continue
+        for metric in valid_display_metrics:
+            col_key = (display_name, metric)
+            max_per_column[col_key] = -float('inf')
+            for dataset in ordered_datasets:
+                if dataset in display_results and config_key in display_results[dataset]:
+                    val = display_results[dataset][config_key].get(metric, 0.0)
+                    if val > max_per_column.get(col_key, -float('inf')):
+                        max_per_column[col_key] = val
+
+    # Print per-dataset rows
+    for dataset in ordered_datasets:
+        row = f"{dataset:<{dataset_col_width}}"
+
+        # Find max value per metric for this row (excluding oracle)
+        row_max = {}
+        for metric in valid_display_metrics:
+            max_val = -float('inf')
+            for display_name, config_key in configs_to_show:
+                if display_name == 'oracle':
+                    continue
+                if dataset in display_results and config_key in display_results[dataset]:
+                    val = display_results[dataset][config_key].get(metric, 0.0)
+                    if val > max_val:
+                        max_val = val
+            row_max[metric] = max_val
+
+        for display_name, config_key in configs_to_show:
+            for metric in valid_display_metrics:
+                if dataset in display_results and config_key in display_results[dataset]:
+                    val = display_results[dataset][config_key].get(metric, 0.0)
+                    # Color the max value green (excluding oracle from coloring)
+                    if display_name != 'oracle' and val == row_max[metric] and val > -float('inf'):
+                        formatted = f"{GREEN}{val:>{metric_col_width}.3f}{RESET}"
+                    else:
+                        formatted = f"{val:>{metric_col_width}.3f}"
+                else:
+                    formatted = f"{'N/A':>{metric_col_width}}"
+
+                row += f" {formatted}"
+
+        print(row)
+
+    # Print separator and BEIR average
+    print("-" * len(header.replace('\033[', '').replace('m', '')))
+
+    # Find max value per metric for BEIR average (excluding oracle)
+    avg_max = {}
+    for metric in valid_display_metrics:
+        max_val = -float('inf')
+        for display_name, config_key in configs_to_show:
+            if display_name == 'oracle':
+                continue
+            if config_key in beir_avg:
+                val = beir_avg[config_key].get(metric, 0.0)
+                if val > max_val:
+                    max_val = val
+        avg_max[metric] = max_val
+
+    avg_row = f"{'BEIR Average':<{dataset_col_width}}"
+    for display_name, config_key in configs_to_show:
+        for metric in valid_display_metrics:
+            if config_key in beir_avg:
+                val = beir_avg[config_key].get(metric, 0.0)
+                # Color the max value green+bold (excluding oracle from coloring)
+                if display_name != 'oracle' and val == avg_max[metric] and val > -float('inf'):
+                    formatted = f"{GREEN}{BOLD}{val:>{metric_col_width}.3f}{RESET}"
+                else:
+                    formatted = f"{val:>{metric_col_width}.3f}"
+            else:
+                formatted = f"{'N/A':>{metric_col_width}}"
+            avg_row += f" {formatted}"
+
+    print(avg_row)
+
+
 def main():
     log_command()
 
@@ -440,6 +630,11 @@ Example (multiple k values):
                         help='Print datasets and configuration without executing evaluations')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Print detailed progress information (dataset status, parsing, etc.)')
+    parser.add_argument('--display_metrics', type=str, nargs='+', default=['NDCG@10'],
+                        help='Metrics to display in corpus breakdown (default: NDCG@10). '
+                             'Examples: ndcg@1 ndcg@5 ndcg@10 map mrr')
+    parser.add_argument('--no_corpus_breakdown', action='store_true',
+                        help='Skip per-corpus breakdown table (only show aggregate)')
 
     args = parser.parse_args()
 
@@ -468,9 +663,12 @@ Example (multiple k values):
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.display_metrics is not None:
+        args.display_metrics = [s.upper() for s in args.display_metrics]
 
     # Store results for all k values
     all_k_results = {}  # k -> beir_avg
+    all_k_dataset_results = {}  # k -> dataset_results (for corpus breakdown)
     all_failed = []
 
     # Process each k value
@@ -598,6 +796,7 @@ Example (multiple k values):
             print("\nComputing BEIR aggregate scores...")
         beir_avg = compute_beir_average(dataset_results)
         all_k_results[k_val] = beir_avg
+        all_k_dataset_results[k_val] = dataset_results
 
         # Save per-k aggregated results
         k_output_file = k_output_dir / "beir_aggregate.json"
@@ -720,19 +919,32 @@ Example (multiple k values):
             line = f"{config:<20} {weights:<10}"
             for metric in metric_names:
                 value = beir_avg[config_key].get(metric, 0.0)
-                formatted = f"{value:<8.4f}"
+                formatted = f"{value:<8.3f}"
 
                 # Skip coloring for oracle rows
                 if config != 'oracle':
                     # Highlight max in green+bold
                     if metric in metric_max and value == metric_max[metric]:
-                        formatted = f"{GREEN}{BOLD}{value:<8.4f}{RESET}"
+                        formatted = f"{GREEN}{BOLD}{value:<8.3f}{RESET}"
                     # Highlight second max in yellow+bold
                     elif metric in metric_second_max and value == metric_second_max[metric]:
-                        formatted = f"{YELLOW}{BOLD}{value:<8.4f}{RESET}"
+                        formatted = f"{YELLOW}{BOLD}{value:<8.3f}{RESET}"
 
                 line += f" {formatted}"
             print(line)
+
+        # Print per-corpus breakdown if requested
+        if not args.no_corpus_breakdown:
+            dataset_results = all_k_dataset_results.get(k_val, {})
+            if dataset_results:
+                print_corpus_breakdown(
+                    dataset_results,
+                    beir_avg,
+                    args.display_metrics,
+                    k_val,
+                    no_baseline=args.no_baseline,
+                    no_oracle=args.no_oracle
+                )
 
     print("="*70)
 

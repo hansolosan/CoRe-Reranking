@@ -444,10 +444,38 @@ def convert_to_native(obj):
 
 def save_results(output_dir, lambda_l1, num_samples, metrics, top_heads, all_heads, command,
                  n_train_docs=None, n_val_docs=None, n_train_base_queries=None, n_val_base_queries=None,
-                 loss='bce'):
-    """Save results for a single lambda value."""
-    base_file = output_dir / f'{loss}_weights_lambda{lambda_l1}_n{num_samples}.json'
-    output_file = get_unique_filepath(base_file)
+                 loss='bce', llm_name=None, output_template=None):
+    """Save results for a single lambda value.
+
+    Args:
+        output_dir: Directory to save results (used if output_template is None)
+        lambda_l1: L1 regularization strength
+        num_samples: Number of samples used for training
+        metrics: Dictionary of evaluation metrics
+        top_heads: List of top heads by weight
+        all_heads: List of all heads with weights
+        command: Command used to run the script
+        n_train_docs: Number of training documents
+        n_val_docs: Number of validation documents
+        n_train_base_queries: Number of training base queries
+        n_val_base_queries: Number of validation base queries
+        loss: Loss function name
+        llm_name: LLM name (for template substitution)
+        output_template: Optional output file template with placeholders:
+                        {lambda}, {n}, {loss}, {llm}
+    """
+    if output_template:
+        # Substitute placeholders in template
+        output_path = output_template.format(
+            **{'lambda': lambda_l1, 'n': num_samples, 'loss': loss, 'llm': llm_name or 'unknown'}
+        )
+        output_file = Path(output_path)
+        # Create parent directory if needed
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file = get_unique_filepath(output_file)
+    else:
+        base_file = output_dir / f'{loss}_weights_lambda{lambda_l1}_n{num_samples}.json'
+        output_file = get_unique_filepath(base_file)
 
     results = {
         'command': command,
@@ -531,6 +559,10 @@ def main():
     parser.add_argument('--input_file', type=str, default=None,
                         help='Original JSON file to determine query groupings. '
                              'If not provided, assumes 5 position variations per query.')
+    parser.add_argument('--output', '-o', type=str, default=None,
+                        help='Output file template. Supports placeholders: {lambda}, {n}, {loss}, {llm}. '
+                             'Example: "weights_{llm}_{loss}_lambda{lambda}.json". '
+                             'Default: head_data/{llm}/{loss}_weights_lambda{lambda}_n{n}.json')
     args = parser.parse_args()
 
     # Capture the command used to run this script
@@ -643,18 +675,18 @@ def main():
                 all_results.append(result)
 
         # Print CV results table (mean ± std)
-        print(f"\n{'Lambda':<10} {'Accuracy':<16} {'Precision':<16} {'Recall':<16} {'F1':<16} {'AUC-ROC':<16} {'Non-zero':<12} {'Sparsity':<16}")
-        print('-'*120)
+        print(f"\n{'Lambda':<10} {'Accuracy':<14} {'Precision':<14} {'Recall':<14} {'F1':<14} {'AUC-ROC':<14} {'Non-zero':<14} {'Sparsity':<14}")
+        print('-'*108)
         for result in all_results:
             m = result['cv_metrics']
-            print(f"{result['lambda_l1']:<10.4f} "
-                  f"{m['accuracy_mean']:.4f}±{m['accuracy_std']:.3f}  "
-                  f"{m['precision_mean']:.4f}±{m['precision_std']:.3f}  "
-                  f"{m['recall_mean']:.4f}±{m['recall_std']:.3f}  "
-                  f"{m['f1_mean']:.4f}±{m['f1_std']:.3f}  "
-                  f"{m['auc_roc_mean']:.4f}±{m['auc_roc_std']:.3f}  "
-                  f"{m['num_nonzero_weights_mean']:.1f}±{m['num_nonzero_weights_std']:.1f}  "
-                  f"{m['sparsity_mean']:.4f}±{m['sparsity_std']:.3f}")
+            acc = f"{m['accuracy_mean']:.4f}±{m['accuracy_std']:.3f}"
+            prec = f"{m['precision_mean']:.4f}±{m['precision_std']:.3f}"
+            rec = f"{m['recall_mean']:.4f}±{m['recall_std']:.3f}"
+            f1 = f"{m['f1_mean']:.4f}±{m['f1_std']:.3f}"
+            auc = f"{m['auc_roc_mean']:.4f}±{m['auc_roc_std']:.3f}"
+            nz = f"{m['num_nonzero_weights_mean']:.1f}±{m['num_nonzero_weights_std']:.1f}"
+            sp = f"{m['sparsity_mean']:.4f}±{m['sparsity_std']:.3f}"
+            print(f"{result['lambda_l1']:<10.4f} {acc:<14} {prec:<14} {rec:<14} {f1:<14} {auc:<14} {nz:<14} {sp:<14}")
 
         # Find best model by mean AUC-ROC
         best_result = max(all_results, key=lambda x: x['cv_metrics']['auc_roc_mean'])
@@ -678,7 +710,9 @@ def main():
                     n_val_docs=0,
                     n_train_base_queries=n_base_queries,
                     n_val_base_queries=0,
-                    loss=args.loss
+                    loss=args.loss,
+                    llm_name=args.llm,
+                    output_template=args.output
                 )
                 if not args.save_best_only:
                     print(f"  Saved lambda={result['lambda_l1']} to {output_file}")
@@ -771,7 +805,9 @@ def main():
                     n_val_docs=len(y_val),
                     n_train_base_queries=n_train_base,
                     n_val_base_queries=n_val_base,
-                    loss=args.loss
+                    loss=args.loss,
+                    llm_name=args.llm,
+                    output_template=args.output
                 )
                 if not args.save_best_only:
                     print(f"  Saved lambda={result['lambda_l1']} to {output_file}")
