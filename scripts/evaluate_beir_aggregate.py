@@ -204,6 +204,8 @@ def run_reranking(
     output_dir: Path,
     no_baseline: bool,
     no_oracle: bool,
+    fusion: bool = False,
+    rrf_k: int = 60,
     qrels_file: Path = None
 ) -> Tuple[str, bool, str]:
     """
@@ -235,6 +237,9 @@ def run_reranking(
 
     if no_oracle:
         cmd.append("--no_oracle")
+
+    if fusion:
+        cmd.extend(["--fusion", "--rrf_k", str(rrf_k)])
 
     try:
         result = subprocess.run(
@@ -624,6 +629,10 @@ Example (multiple k values):
                         help='Skip baseline retriever evaluation (only evaluate reranked results)')
     parser.add_argument('--no_oracle', action='store_true',
                         help='Skip oracle (upper bound) evaluation')
+    parser.add_argument('--fusion', action='store_true',
+                        help='Include RRF fusion of baseline and reranked results (combines retriever + attention head scores)')
+    parser.add_argument('--rrf_k', type=int, default=60,
+                        help='RRF constant k for fusion (default: 60)')
     parser.add_argument('--n_jobs', type=int, default=4,
                         help='Number of parallel worker processes for dataset evaluation (default: 4)')
     parser.add_argument('--dry_run', action='store_true',
@@ -752,6 +761,8 @@ Example (multiple k values):
                     k_output_dir,
                     args.no_baseline,
                     args.no_oracle,
+                    args.fusion,
+                    args.rrf_k,
                     qrels_file
                 )
                 futures[future] = dataset

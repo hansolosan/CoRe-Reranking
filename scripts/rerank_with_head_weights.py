@@ -291,9 +291,102 @@ def match_at_k(relevances, k):
     return 1.0 if np.any(relevances > 0) else 0.0
 
 
+def reciprocal_rank_fusion(rankings, k=60):
+    """
+    Combine multiple rankings using Reciprocal Rank Fusion (RRF).
+
+    RRF score for document d = sum over rankings of 1/(k + rank(d))
+
+    Args:
+        rankings: list of lists, each inner list is doc_ids in rank order
+        k: RRF constant (default 60, as in the original paper)
+
+    Returns:
+        fused_ranking: list of doc_ids sorted by RRF score (descending)
+        fused_scores: dict of doc_id -> RRF score
+    """
+    scores = defaultdict(float)
+
+    for ranking in rankings:
+        for rank, doc_id in enumerate(ranking, start=1):
+            scores[doc_id] += 1.0 / (k + rank)
+
+    # Sort by score descending
+    sorted_docs = sorted(scores.keys(), key=lambda d: scores[d], reverse=True)
+
+    return sorted_docs, dict(scores)
+
+
+def compute_fused_scores(features, weights, docs_per_query, top_k_heads=None, rrf_k=60):
+    """
+    Compute fused scores combining baseline (original order) and reranked scores using RRF.
+
+    Args:
+        features: (num_docs, num_heads) attention features
+        weights: (num_heads,) head weights
+        docs_per_query: number of documents per query (int) or array
+        top_k_heads: if set, only use top-k heads for reranking
+        rrf_k: RRF constant (default 60)
+
+    Returns:
+        fused_scores: (num_docs,) array of RRF-fused scores
+    """
+    # Compute reranked scores
+    rerank_scores = compute_scores(features, weights, top_k=top_k_heads)
+
+    # Baseline scores (preserve original order - higher index = lower rank)
+    baseline_scores = np.arange(len(features), 0, -1, dtype=float)
+
+    fused_scores = np.zeros(len(features))
+
+    if isinstance(docs_per_query, (list, np.ndarray)):
+        doc_offset = 0
+        for q_idx in range(len(docs_per_query)):
+            n_docs = docs_per_query[q_idx]
+
+            # Get scores for this query
+            q_baseline = baseline_scores[doc_offset:doc_offset + n_docs]
+            q_rerank = rerank_scores[doc_offset:doc_offset + n_docs]
+
+            # Get rankings (indices sorted by score descending)
+            baseline_ranking = np.argsort(-q_baseline)
+            rerank_ranking = np.argsort(-q_rerank)
+
+            # Compute RRF scores
+            q_fused = np.zeros(n_docs)
+            for rank, idx in enumerate(baseline_ranking, start=1):
+                q_fused[idx] += 1.0 / (rrf_k + rank)
+            for rank, idx in enumerate(rerank_ranking, start=1):
+                q_fused[idx] += 1.0 / (rrf_k + rank)
+
+            fused_scores[doc_offset:doc_offset + n_docs] = q_fused
+            doc_offset += n_docs
+    else:
+        num_queries = len(features) // docs_per_query
+        for q in range(num_queries):
+            start = q * docs_per_query
+            end = start + docs_per_query
+
+            q_baseline = baseline_scores[start:end]
+            q_rerank = rerank_scores[start:end]
+
+            baseline_ranking = np.argsort(-q_baseline)
+            rerank_ranking = np.argsort(-q_rerank)
+
+            q_fused = np.zeros(docs_per_query)
+            for rank, idx in enumerate(baseline_ranking, start=1):
+                q_fused[idx] += 1.0 / (rrf_k + rank)
+            for rank, idx in enumerate(rerank_ranking, start=1):
+                q_fused[idx] += 1.0 / (rrf_k + rank)
+
+            fused_scores[start:end] = q_fused
+
+    return fused_scores
+
+
 def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_per_query,
                           top_k_heads=None, ks=[1, 5, 10], metric_types=None, use_baseline=False,
-                          use_oracle=False, external_qrels=None):
+                          use_oracle=False, use_fusion=False, rrf_k=60, external_qrels=None):
     """
     Evaluate ranking metrics using BEIR's EvaluateRetrieval.
 
@@ -309,6 +402,8 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
         metric_types: list of metric types to compute (ignored - BEIR computes all)
         use_baseline: if True, use original document order as baseline (no reranking)
         use_oracle: if True, move gold document to first position (upper bound)
+        use_fusion: if True, use RRF fusion of baseline and reranked scores
+        rrf_k: RRF constant (default 60)
         external_qrels: dict of {query_id: {doc_id: relevance}} from external qrels file.
                        If provided, uses this for evaluation instead of labels from .npz.
                        IMPORTANT: For proper NDCG, this should contain ALL relevant docs,
@@ -328,6 +423,9 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
         # For oracle, assign highest score to gold document if it exists
         scores = np.zeros(len(features))
         # Will be handled in ranking phase below
+    elif use_fusion:
+        # RRF fusion of baseline and reranked scores
+        scores = compute_fused_scores(features, weights, docs_per_query, top_k_heads, rrf_k)
     else:
         scores = compute_scores(features, weights, top_k=top_k_heads)
 
@@ -505,7 +603,8 @@ def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_pe
 
 
 def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=None,
-                     ks=[1, 5, 10], metric_types=None, use_baseline=False, use_oracle=False):
+                     ks=[1, 5, 10], metric_types=None, use_baseline=False, use_oracle=False,
+                     use_fusion=False, rrf_k=60):
     """
     Evaluate ranking metrics.
 
@@ -520,6 +619,8 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
                      If None, computes all metrics.
         use_baseline: if True, use original document order as baseline (no reranking)
         use_oracle: if True, move gold document to first position (upper bound)
+        use_fusion: if True, use RRF fusion of baseline and reranked scores
+        rrf_k: RRF constant (default 60)
 
     Returns:
         metrics: dict of metric name -> value
@@ -534,6 +635,9 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
     elif use_oracle:
         # For oracle, will handle per-query below
         scores = np.zeros(len(features))
+    elif use_fusion:
+        # RRF fusion of baseline and reranked scores
+        scores = compute_fused_scores(features, weights, docs_per_query, top_k_heads, rrf_k)
     else:
         scores = compute_scores(features, weights, top_k=top_k_heads)
 
@@ -642,6 +746,7 @@ def evaluate_ranking(features, labels, weights, docs_per_query=50, top_k_heads=N
 def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, metadata,
                                   top_k_list, ks, metric_types, docs_per_query_override,
                                   compare_equal, include_baseline=True, include_oracle=True,
+                                  include_fusion=False, rrf_k=60,
                                   evaluator='custom', external_qrels=None, verbose=True,
                                   return_ranked_results=False):
     """
@@ -650,6 +755,8 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
     Args:
         include_baseline: if True, compute and include baseline retriever performance
         include_oracle: if True, compute and include oracle (upper bound) performance
+        include_fusion: if True, compute RRF fusion of baseline and reranked scores
+        rrf_k: RRF constant for fusion (default 60)
         evaluator: 'custom' or 'beir' - which evaluation method to use
         external_qrels: dict of {query_id: {doc_id: relevance}} from external qrels file.
                        If provided with evaluator='beir', uses this for proper NDCG computation.
@@ -703,6 +810,8 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
                 metric_types=kwargs.get('metric_types'),
                 use_baseline=kwargs.get('use_baseline', False),
                 use_oracle=kwargs.get('use_oracle', False),
+                use_fusion=kwargs.get('use_fusion', False),
+                rrf_k=kwargs.get('rrf_k', 60),
                 external_qrels=external_qrels
             )
 
@@ -716,7 +825,9 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
             ks=kwargs['ks'],
             metric_types=kwargs.get('metric_types'),
             use_baseline=kwargs.get('use_baseline', False),
-            use_oracle=kwargs.get('use_oracle', False)
+            use_oracle=kwargs.get('use_oracle', False),
+            use_fusion=kwargs.get('use_fusion', False),
+            rrf_k=kwargs.get('rrf_k', 60)
         )
 
     # Evaluate baseline (original retriever ranking) first if requested
@@ -800,6 +911,26 @@ def evaluate_single_feature_file(feature_file, llm_name, num_samples, weights, m
                 'metrics': eq_metrics
             })
 
+        # Evaluate fusion (RRF of baseline + reranked) if requested
+        if include_fusion:
+            fusion_metrics = eval_func(
+                features=X,
+                labels=y,
+                weights=weights,
+                docs_per_query=docs_per_query,
+                top_k_heads=top_k,
+                ks=ks,
+                metric_types=metric_types,
+                use_fusion=True,
+                rrf_k=rrf_k
+            )
+
+            results.append({
+                'config': f"{label}+rrf",
+                'weights': metadata['type'],
+                'metrics': fusion_metrics
+            })
+
     # Compute ranked results if requested
     ranked_results = None
     if return_ranked_results:
@@ -854,6 +985,10 @@ def main():
                         help='Skip computing baseline retriever performance')
     parser.add_argument('--no_oracle', action='store_true',
                         help='Skip computing oracle (upper bound) performance')
+    parser.add_argument('--fusion', action='store_true',
+                        help='Include RRF fusion of baseline and reranked results')
+    parser.add_argument('--rrf_k', type=int, default=60,
+                        help='RRF constant k (default: 60, as in the original RRF paper)')
     parser.add_argument('--evaluator', type=str, default='beir', choices=['custom', 'beir'],
                         help='Evaluation method: beir (default, uses BEIR library) or custom (built-in metrics). '
                              'Note: BEIR requires "pip install beir". Use --qrels to provide external qrels for proper NDCG.')
@@ -935,6 +1070,8 @@ def main():
             compare_equal=args.compare_equal,
             include_baseline=not args.no_baseline,
             include_oracle=not args.no_oracle,
+            include_fusion=args.fusion,
+            rrf_k=args.rrf_k,
             evaluator=args.evaluator,
             external_qrels=external_qrels,
             verbose=True,

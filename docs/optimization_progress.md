@@ -105,6 +105,7 @@ Modular trainer classes for easy loss function swapping:
 - ✅ Direct feature file input (`--feature_file` / `-f`)
 - ✅ Query-level train/val split (no data leakage between base queries)
 - ✅ JSON-based query grouping (`--input_file` to load query variations)
+- ✅ **Custom output template** (`--output` / `-o`) with placeholders: `{lambda}`, `{n}`, `{loss}`, `{llm}`
 
 **Note on normalization**: The loss is normalized by the number of samples, making λ comparable across different dataset sizes.
 
@@ -137,6 +138,10 @@ Computes ranking metrics on head detection data:
 - ✅ `--no_baseline` flag to skip baseline evaluation
 - ✅ `--no_oracle` flag to skip oracle (upper bound) evaluation
 - ✅ **Save ranked results** - `--save_ranked` outputs ranked document lists to `reranked_results/<llm>/k<k>/`
+- ✅ **RRF Fusion** - `--fusion` combines baseline retriever and attention head rankings using Reciprocal Rank Fusion
+  - Formula: `RRF(d) = Σ 1/(k + rank(d))` where k defaults to 60
+  - Configurable via `--rrf_k` parameter
+  - Results appear as `top-8+rrf` in output
 - ✅ Uses shared utilities from `utils.py`
 
 ### 7. Feature Comparison (`scripts/compare_features.py`)
@@ -176,6 +181,11 @@ Computes aggregate BEIR scores across all 26 BEIR datasets:
   - Loads from `{beir_dir}/{corpus}/qrels/test.tsv`
   - Supports both cqadupstack formats: `cqadupstack/android/` and `cqadupstack-android/`
   - BEIR evaluator is now the default for proper NDCG computation
+- ✅ **Per-corpus breakdown table** - Shows baseline, oracle, and best config per dataset
+  - `--display_metrics` selects which metrics to show (default: `NDCG@10`)
+  - `--no_corpus_breakdown` skips the breakdown table
+  - Row highlighting: green for best non-oracle value per row
+- ✅ **RRF Fusion support** - `--fusion` and `--rrf_k` passed to reranking subprocess
 
 **BEIR datasets (15 total after aggregation):**
 - 14 main: trec-covid, nfcorpus, dbpedia-entity, scifact, scidocs, fiqa, nq, fever, climate-fever, hotpotqa, webis-touche2020, msmarco, quora, arguana
@@ -210,6 +220,25 @@ top-16               bce        0.3512   0.4445   0.4891   0.4189   0.4623  <- y
 ```
 
 **Note**: Oracle shows upper bound performance (gold document moved to rank 1 if present). Oracle results are excluded from color highlighting to avoid skewing comparisons between actual reranking methods.
+
+**Per-corpus breakdown output:**
+```
+======================================================================
+Per-Corpus Breakdown (k=40 documents)
+======================================================================
+Dataset              baseline      oracle  best (top-8)
+------------------------------------------------------------
+arguana                 0.412       0.981         0.439
+climate-fever           0.345       0.976         0.356
+dbpedia-entity          0.389       0.980         0.412
+...
+cqadupstack             0.456       0.984         0.482
+------------------------------------------------------------
+BEIR Average            0.423       0.982         0.457
+```
+- Rows show per-dataset performance for baseline, oracle, and best reranking config
+- Best non-oracle value per row is highlighted in green
+- `--display_metrics` controls which metrics are shown (can specify multiple)
 
 ### 11. Batch Feature Extraction (`scripts/extract_features_batch.sh`)
 Shell script for batch feature extraction across multiple datasets and k values:
@@ -475,6 +504,11 @@ python scripts/train_head_weights_bce.py --llm mistral \
 python scripts/train_head_weights_bce.py --llm mistral \
     --input_file head_data/nq_core.json \
     --lambda_l1 1e-3 1e-2 1e-1 --n_jobs -1
+
+# Custom output template with placeholders
+python scripts/train_head_weights_bce.py --llm mistral \
+    --lambda_l1 1e-3 1e-2 1e-1 --cv 5 \
+    --output "models/{llm}/weights_{loss}_lambda{lambda}.json"
 ```
 
 **Note**: Lambda values are for the normalized loss `(1/n)*sum(loss) + λ*||w||_1`. Typical range: `1e-5` to `1.0`.
@@ -526,6 +560,24 @@ python scripts/evaluate_beir_aggregate.py \
     --top_k_heads 1 2 4 8 16 32 \
     --n_jobs 8 \
     --output_dir results/beir_k10
+
+# With RRF fusion (combines retriever + attention head rankings)
+python scripts/rerank_with_head_weights.py --llm mistral \
+    --weight_file head_data/mistral/bce_weights_lambda0.01_n1000.json \
+    -f head_data/mistral/attention_features_nq_k40.npz \
+    --top_k_heads 8 16 \
+    --fusion --rrf_k 60
+
+# BEIR aggregate with fusion and per-corpus breakdown
+python scripts/evaluate_beir_aggregate.py \
+    --llm mistral \
+    --weight_file head_data/mistral/bce_weights_lambda0.0001_n5000.json \
+    --feature_dir head_data/mistral \
+    --k 40 \
+    --top_k_heads 8 16 \
+    --fusion \
+    --display_metrics NDCG@1 NDCG@5 NDCG@10 \
+    --output_dir results/beir_fusion
 ```
 
 **Evaluation modes:**
