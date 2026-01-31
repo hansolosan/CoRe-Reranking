@@ -1,11 +1,48 @@
+"""
+Contrastive Retrieval (CoRe) Head Detector.
+
+This module implements the CoRe detector that identifies retrieval heads by
+contrasting attention scores between positive and hard negative documents.
+"""
 import math
 import transformers
 import torch
 from .custom.custom_cache import DynamicCacheWithQuery
 
 class HeadDetector():
+    """
+    Contrastive Retrieval (CoRe) Head Detector.
+
+    Identifies retrieval-relevant attention heads by computing contrastive scores
+    between positive and hard negative documents. Uses softmax-normalized attention
+    to measure how much each head focuses on the positive document versus negatives.
+
+    Attributes:
+        tokenizer: HuggingFace tokenizer for the LLM
+        llm: Custom LLM with attention caching capabilities
+        prompt_prefix: Model-specific prompt prefix (e.g., '[INST]' for Mistral)
+        prompt_suffix: Model-specific prompt suffix (e.g., '[/INST]' for Mistral)
+        retrieval_instruction: Instruction text before documents
+        retrieval_instruction_late: Instruction text before query
+        offset: Tokenization offset (1 for Mistral, 0 for others)
+        temp: Temperature for softmax in contrastive scoring
+        num_layer: Number of transformer layers
+        num_head: Number of attention heads per layer
+        num_query: Counter for number of queries processed
+        head_score: Dict mapping "{layer}-{head}" to accumulated scores
+    """
 
     def __init__(self, llm_name, temp=1.0, prune=0.0) -> None:
+        """
+        Initialize the CoRe head detector.
+
+        Args:
+            llm_name: HuggingFace model name/path (e.g., 'mistralai/Mistral-7B-Instruct-v0.2')
+            temp: Temperature for softmax in contrastive scoring. Lower values make
+                  the distribution more peaked (default: 1.0)
+            prune: Layer pruning ratio [0, 1). Removes top layers from model
+                   (default: 0.0, no pruning). E.g., prune=0.3 removes top 30% of layers.
+        """
         # set up LLM
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(llm_name)
         config = transformers.AutoConfig.from_pretrained(llm_name)
@@ -64,11 +101,38 @@ class HeadDetector():
                 self.head_score[f"{layer}-{head}"] = 0
 
     def get_head_score(self):
+        """
+        Get normalized head scores averaged over all queries.
+
+        Divides accumulated scores by the number of queries processed to get
+        average scores per head across all queries.
+
+        Returns:
+            dict: Mapping from "{layer}-{head}" to average score [0, 1].
+                  Higher scores indicate heads that better distinguish positive
+                  from negative documents.
+        """
         for head in self.head_score.keys():
             self.head_score[head] /= self.num_query
         return self.head_score
 
     def compute_retrieval_score(self, query, documents, pos_idx, neg_idx):
+        """
+        Compute and accumulate retrieval scores for all heads on one query.
+
+        Processes a query with positive and negative documents, computes contrastive
+        attention scores for each head, and accumulates them into head_score.
+
+        Args:
+            query: Query text string
+            documents: List of document text strings
+            pos_idx: Index of the positive document in documents list
+            neg_idx: List of indices of hard negative documents in documents list
+
+        Side effects:
+            Updates self.head_score by adding scores for this query
+            Increments self.num_query counter
+        """
         prompt, pos_span, neg_span, query_span = self.prepare_input(query, documents, pos_idx, neg_idx)
         score = self.score_documents(prompt, pos_span, neg_span, query_span)
         for layer in range(self.num_layer):
@@ -77,6 +141,24 @@ class HeadDetector():
         self.num_query += 1
 
     def score_documents(self, prompt, pos_span, neg_span, query_span):
+        """
+        Score documents using contrastive attention.
+
+        Runs a forward pass through the LLM to compute attention weights, then
+        calculates contrastive scores showing how much attention each head pays
+        to the positive document versus negative documents.
+
+        Args:
+            prompt: Full formatted prompt string including documents and query
+            pos_span: Tuple (start_idx, end_idx) of positive document tokens
+            neg_span: List of tuples (start_idx, end_idx) for negative document tokens
+            query_span: Tuple (start_idx, end_idx) of query tokens
+
+        Returns:
+            torch.Tensor: Contrastive scores of shape (num_layer, num_head).
+                          Each value is in [0, 1] from softmax over positive and
+                          negative documents. Higher = head focuses more on positive.
+        """
         tokenized_input = self.tokenizer(prompt,return_tensors='pt').to(self.llm.device)
         _input_ids = tokenized_input.input_ids
         _query_indices = list(range(query_span[0], query_span[1]+1))
@@ -125,6 +207,26 @@ class HeadDetector():
         return head_scores
 
     def prepare_input(self, query, documents, pos_idx, neg_idx):
+        """
+        Prepare formatted prompt and compute token spans for documents and query.
+
+        Formats the prompt with model-specific prefixes/suffixes and computes
+        token indices for the positive document, negative documents, and query.
+        Token spans are needed to extract attention weights for specific text regions.
+
+        Args:
+            query: Query text string
+            documents: List of document text strings
+            pos_idx: Index of the positive document in documents list
+            neg_idx: List of indices of hard negative documents in documents list
+
+        Returns:
+            tuple: (llm_prompt, pos_span, neg_span, query_span) where:
+                - llm_prompt: Full formatted prompt string
+                - pos_span: Tuple (start_idx, end_idx) of positive document tokens
+                - neg_span: List of tuples for negative document token spans
+                - query_span: Tuple (start_idx, end_idx) of query tokens
+        """
         neg_span = [] # hard negatives
         llm_prompt = self.prompt_prefix + self.retrieval_instruction
 
@@ -153,6 +255,21 @@ class HeadDetector():
 
     @classmethod
     def _get_attn_weights(cls, key_states, query_states):
+        """
+        Compute attention weights from key and query states.
+
+        Implements the attention computation: softmax(QK^T / sqrt(d_k)) with causal masking.
+        Supports Grouped Query Attention (GQA) where key/value heads may be fewer than
+        query heads.
+
+        Args:
+            key_states: Cached key states, shape (num_layer, bsz, num_kv_heads, seq_len, head_dim)
+            query_states: Cached query states, shape (num_layer, bsz, num_heads, q_len, head_dim)
+
+        Returns:
+            torch.Tensor: Attention weights of shape (num_layer, bsz, num_heads, q_len, seq_len).
+                          Values are in [0, 1] and sum to 1 over the seq_len dimension.
+        """
         num_layer, bsz, num_heads, q_len, head_dim = query_states.size()
         num_key_value_heads = key_states.size(2)
         num_key_value_groups = num_heads // num_key_value_heads
@@ -177,6 +294,20 @@ class HeadDetector():
 
     @classmethod
     def _get_causal_mask(cls, attn_weights):
+        """
+        Create causal attention mask preventing attention to future tokens.
+
+        Generates a mask where valid positions are 0 and invalid (future) positions
+        are set to a large negative value (min float) so they become ~0 after softmax.
+
+        Args:
+            attn_weights: Attention weight tensor, used only for shape and dtype.
+                          Expected shape: (..., query_len, seq_len)
+
+        Returns:
+            torch.Tensor: Causal mask of same shape as attn_weights.
+                          Valid positions are 0, invalid positions are -inf.
+        """
         query_len, seq_len = attn_weights.size(-2), attn_weights.size(-1)
         causal_mask = torch.ones_like(attn_weights.transpose(-1,-2).squeeze(1))
         causal_mask = torch.triu(causal_mask, diagonal=-(seq_len-query_len))

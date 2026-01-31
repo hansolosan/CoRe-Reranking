@@ -18,22 +18,51 @@ warnings.filterwarnings('ignore')
 
 
 class BaseTrainer(ABC):
-    """Abstract base class for head weight trainers."""
+    """Abstract base class for head weight trainers with temperature-scaled softmax."""
 
-    def __init__(self, lambda_l1=0.01, max_iter=1000, random_state=42):
+    def __init__(self, lambda_l1=0.01, temperature=1.0, max_iter=1000, random_state=42):
         """
         Initialize trainer.
 
         Args:
             lambda_l1: L1 regularization strength
+            temperature: Temperature for softmax over features. Lower values (e.g., 0.001)
+                        make the feature distribution more peaked (few heads dominate).
+                        Higher values make it more uniform. Default: 1.0 (standard softmax)
             max_iter: Maximum iterations for optimization
             random_state: Random seed for reproducibility
         """
         self.lambda_l1 = lambda_l1
+        self.temperature = temperature
         self.max_iter = max_iter
         self.random_state = random_state
         self.weights_ = None
         self.intercept_ = None
+
+    def _apply_temperature_softmax(self, X):
+        """
+        Apply temperature-scaled softmax to features.
+
+        Like CoRe, applies softmax(features / temp) to normalize feature importance.
+
+        Args:
+            X: Features array of shape (n_samples, n_features) or (n_features,)
+
+        Returns:
+            Softmax-normalized features of the same shape as input
+        """
+        X_scaled = X / self.temperature
+
+        if X.ndim > 1:
+            # Batch processing: (n_samples, n_features)
+            X_max = X_scaled.max(axis=1, keepdims=True)
+            X_exp = np.exp(X_scaled - X_max)
+            return X_exp / X_exp.sum(axis=1, keepdims=True)
+        else:
+            # Single sample: (n_features,)
+            X_max = X_scaled.max()
+            X_exp = np.exp(X_scaled - X_max)
+            return X_exp / X_exp.sum()
 
     @property
     @abstractmethod
@@ -123,24 +152,27 @@ class BaseTrainer(ABC):
 
 class BCETrainer(BaseTrainer):
     """
-    Binary Cross-Entropy trainer with L1 regularization.
+    Binary Cross-Entropy trainer with L1 regularization and temperature-scaled softmax.
 
-    Uses sklearn's LogisticRegression with L1 penalty (Lasso).
+    Applies temperature-scaled softmax to features before training:
+        features_normalized = softmax(features / T)
+    Then uses sklearn's LogisticRegression with L1 penalty (Lasso).
     The loss is normalized by the number of samples:
         Loss = (1/n) * sum(BCE_loss) + lambda * ||w||_1
     """
 
-    def __init__(self, lambda_l1=0.01, max_iter=1000, random_state=42, class_weight='balanced'):
+    def __init__(self, lambda_l1=0.01, temperature=1.0, max_iter=1000, random_state=42, class_weight='balanced'):
         """
         Initialize BCE trainer.
 
         Args:
             lambda_l1: L1 regularization strength (normalized by num samples)
+            temperature: Temperature for softmax over features. Default: 1.0 (standard softmax)
             max_iter: Maximum iterations for SAGA solver
             random_state: Random seed
             class_weight: Class weighting strategy ('balanced' or None)
         """
-        super().__init__(lambda_l1, max_iter, random_state)
+        super().__init__(lambda_l1, temperature, max_iter, random_state)
         self.class_weight = class_weight
         self._model = None
 
@@ -150,13 +182,16 @@ class BCETrainer(BaseTrainer):
 
     def fit(self, X_train, y_train, docs_per_query_train=None):
         """
-        Fit logistic regression model.
+        Fit logistic regression model with temperature-scaled softmax features.
 
         sklearn's objective is: ||w||_1 + C * sum(log_loss)
         We want normalized BCE: (1/n) * sum(log_loss) + lambda * ||w||_1
 
         These are equivalent when: C = 1 / (n * lambda)
         """
+        # Apply temperature-scaled softmax to features
+        X_train_softmax = self._apply_temperature_softmax(X_train)
+
         n_samples = len(y_train)
         C = 1.0 / (n_samples * self.lambda_l1) if self.lambda_l1 > 0 else 1e6
 
@@ -169,7 +204,7 @@ class BCETrainer(BaseTrainer):
             class_weight=self.class_weight
         )
 
-        self._model.fit(X_train, y_train)
+        self._model.fit(X_train_softmax, y_train)
 
         # Store weights for interface compatibility
         self.weights_ = self._model.coef_[0].copy()
@@ -178,10 +213,647 @@ class BCETrainer(BaseTrainer):
         return self
 
     def predict_proba(self, X):
-        """Predict probability of positive class."""
+        """Predict probability of positive class with temperature-scaled softmax features."""
         if self._model is None:
             raise ValueError("Model not fitted yet. Call fit() first.")
-        return self._model.predict_proba(X)[:, 1]
+        X_softmax = self._apply_temperature_softmax(X)
+        return self._model.predict_proba(X_softmax)[:, 1]
+
+
+class BCEWithTemperatureTrainer(BaseTrainer):
+    """
+    Binary Cross-Entropy trainer with temperature-scaled softmax features.
+
+    Similar to CoRe's approach, this applies temperature scaling then softmax to the
+    features (attention scores from each head) before linear combination:
+        features_normalized = softmax(features / T)
+        logit = w^T features_normalized
+        p = sigmoid(logit)
+        Loss = (1/n) * sum(-y*log(p) - (1-y)*log(1-p)) + lambda * ||w||_1
+
+    This normalizes feature importance (like CoRe normalizes document scores) so that
+    the most important heads are emphasized. Lower temperature makes the distribution
+    more peaked (few heads dominate), higher temperature makes it more uniform.
+    """
+
+    def __init__(self, lambda_l1=0.01, temperature=1.0, max_iter=1000,
+                 random_state=42, learning_rate=0.01, class_weight='balanced'):
+        """
+        Initialize BCE trainer with temperature-scaled softmax features.
+
+        Args:
+            lambda_l1: L1 regularization strength
+            temperature: Temperature for softmax over features. Lower values (e.g., 0.001)
+                        make the feature distribution more peaked (few heads dominate).
+                        Higher values (e.g., 10.0) make it more uniform.
+                        Default: 1.0 (standard softmax)
+            max_iter: Maximum iterations for gradient descent
+            random_state: Random seed
+            learning_rate: Learning rate for gradient descent
+            class_weight: Class weighting strategy ('balanced' or None)
+        """
+        super().__init__(lambda_l1, temperature, max_iter, random_state)
+        self.learning_rate = learning_rate
+        self.class_weight = class_weight
+
+    @property
+    def name(self) -> str:
+        return "bce_temp"
+
+    def fit(self, X_train, y_train, docs_per_query_train=None):
+        """
+        Fit model using BCE loss with temperature-scaled softmax features.
+
+        Like CoRe, applies softmax(features / temp) before combining with weights.
+        Uses proximal gradient descent with soft thresholding for L1 regularization.
+
+        Args:
+            X_train: Training features (n_samples, n_features)
+            y_train: Training labels (n_samples,)
+            docs_per_query_train: Not used (for interface compatibility)
+
+        Returns:
+            self
+        """
+        n_samples, n_features = X_train.shape
+        rng = np.random.RandomState(self.random_state)
+
+        # Initialize weights
+        self.weights_ = rng.randn(n_features) * 0.01
+        self.intercept_ = 0.0
+
+        # Compute class weights
+        if self.class_weight == 'balanced':
+            n_pos = np.sum(y_train)
+            n_neg = n_samples - n_pos
+            if n_pos > 0 and n_neg > 0:
+                w_pos = n_samples / (2 * n_pos)
+                w_neg = n_samples / (2 * n_neg)
+                sample_weights = np.where(y_train == 1, w_pos, w_neg)
+            else:
+                sample_weights = np.ones(n_samples)
+        else:
+            sample_weights = np.ones(n_samples)
+
+        # Gradient descent with proximal step for L1
+        for iteration in range(self.max_iter):
+            # Apply temperature-scaled softmax to features (like CoRe)
+            X_softmax = self._apply_temperature_softmax(X_train)
+
+            # Compute logits with softmax-normalized features
+            logits = X_softmax @ self.weights_ + self.intercept_
+            probs = 1 / (1 + np.exp(-logits))  # sigmoid
+
+            # Compute gradient with respect to weights
+            # Chain rule: d/dw = (p - y) * softmax(X/T)
+            residuals = (probs - y_train) * sample_weights
+            grad_weights = X_softmax.T @ residuals / n_samples
+            grad_intercept = residuals.mean()
+
+            # Gradient step
+            self.weights_ -= self.learning_rate * grad_weights
+            self.intercept_ -= self.learning_rate * grad_intercept
+
+            # Proximal step (soft thresholding for L1)
+            self.weights_ = np.sign(self.weights_) * np.maximum(
+                np.abs(self.weights_) - self.learning_rate * self.lambda_l1, 0
+            )
+
+        return self
+
+    def predict_proba(self, X):
+        """
+        Predict probability of positive class with temperature-scaled softmax features.
+
+        Args:
+            X: Features (n_samples, n_features)
+
+        Returns:
+            probabilities: (n_samples,) probability of positive class
+        """
+        if self.weights_ is None:
+            raise ValueError("Model not fitted yet. Call fit() first.")
+
+        # Apply same temperature-scaled softmax as in training
+        X_softmax = self._apply_temperature_softmax(X)
+
+        # Compute logits and probabilities
+        logits = X_softmax @ self.weights_ + self.intercept_
+        return 1 / (1 + np.exp(-logits))
+
+
+class HingeLossTrainer(BaseTrainer):
+    """
+    Hinge loss trainer for pairwise ranking with Elastic Net regularization and temperature-scaled softmax.
+
+    Applies temperature-scaled softmax to features before computing scores:
+        features_normalized = softmax(features / T)
+
+    Optimizes:
+        L = (1/n_pairs) * sum(max(0, margin - (s_pos - s_neg))) + lambda_l1 * ||w||_1 + lambda_l2 * ||w||_2^2
+
+    Combines:
+    - Hinge loss: Margin-based separation between positive and negative docs
+    - L1 regularization: Sparsity
+    - L2 regularization: Stability and handling correlated features
+    """
+
+    def __init__(self, lambda_l1=0.01, lambda_l2=0.01, margin=1.0, temperature=1.0,
+                 max_iter=1000, random_state=42, learning_rate=0.01):
+        """
+        Initialize Hinge loss trainer.
+
+        Args:
+            lambda_l1: L1 regularization strength (sparsity)
+            lambda_l2: L2 regularization strength (stability)
+            margin: Margin for hinge loss (positive should score at least margin higher than negative)
+            temperature: Temperature for softmax over features. Default: 1.0 (standard softmax)
+            max_iter: Maximum iterations for optimization
+            random_state: Random seed
+            learning_rate: Learning rate for gradient descent
+        """
+        super().__init__(lambda_l1, temperature, max_iter, random_state)
+        self.lambda_l2 = lambda_l2
+        self.margin = margin
+        self.learning_rate = learning_rate
+
+    @property
+    def name(self) -> str:
+        return "hinge"
+
+    def fit(self, X_train, y_train, docs_per_query_train=None):
+        """
+        Fit model using pairwise hinge loss with temperature-scaled softmax features.
+
+        Args:
+            X_train: Training features (n_docs, n_features)
+            y_train: Training labels (n_docs,) - 1 for positive, 0 for negative
+            docs_per_query_train: Array of docs per query (required for pairwise loss)
+        """
+        if docs_per_query_train is None:
+            raise ValueError("HingeLoss trainer requires docs_per_query_train")
+
+        n_features = X_train.shape[1]
+        rng = np.random.RandomState(self.random_state)
+
+        # Initialize weights
+        self.weights_ = rng.randn(n_features) * 0.01
+        self.intercept_ = 0.0
+
+        # Apply temperature-scaled softmax to all features
+        X_train_softmax = self._apply_temperature_softmax(X_train)
+
+        # Create pairwise training examples
+        pairs = []
+        doc_offset = 0
+        for n_docs in docs_per_query_train:
+            X_q = X_train_softmax[doc_offset:doc_offset + n_docs]
+            y_q = y_train[doc_offset:doc_offset + n_docs]
+
+            pos_indices = np.where(y_q == 1)[0]
+            neg_indices = np.where(y_q == 0)[0]
+
+            # Create all positive-negative pairs for this query
+            for pos_idx in pos_indices:
+                for neg_idx in neg_indices:
+                    pairs.append({
+                        'x_pos': X_q[pos_idx],
+                        'x_neg': X_q[neg_idx]
+                    })
+
+            doc_offset += n_docs
+
+        if len(pairs) == 0:
+            raise ValueError("No positive-negative pairs found in training data")
+
+        # Gradient descent with Elastic Net
+        for iteration in range(self.max_iter):
+            grad = np.zeros(n_features)
+            loss = 0.0
+
+            for pair in pairs:
+                x_pos = pair['x_pos']
+                x_neg = pair['x_neg']
+
+                # Scores
+                s_pos = x_pos @ self.weights_
+                s_neg = x_neg @ self.weights_
+
+                # Hinge loss: max(0, margin - (s_pos - s_neg))
+                violation = self.margin - (s_pos - s_neg)
+
+                if violation > 0:
+                    # Gradient: -( x_pos - x_neg )
+                    grad += -(x_pos - x_neg)
+                    loss += violation
+
+            # Average over pairs
+            grad /= len(pairs)
+            loss /= len(pairs)
+
+            # Add L2 gradient
+            grad += 2 * self.lambda_l2 * self.weights_
+
+            # Gradient step
+            self.weights_ -= self.learning_rate * grad
+
+            # Proximal step for L1 (soft thresholding)
+            self.weights_ = np.sign(self.weights_) * np.maximum(
+                np.abs(self.weights_) - self.learning_rate * self.lambda_l1, 0
+            )
+
+        return self
+
+    def predict_proba(self, X):
+        """Predict scores with temperature-scaled softmax features."""
+        if self.weights_ is None:
+            raise ValueError("Model not fitted yet. Call fit() first.")
+        X_softmax = self._apply_temperature_softmax(X)
+        scores = X_softmax @ self.weights_
+        # Convert to probabilities using sigmoid
+        return 1 / (1 + np.exp(-scores))
+
+
+class ApproxNDCGTrainer(BaseTrainer):
+    """
+    ApproxNDCG trainer - differentiable approximation of NDCG.
+
+    Optimizes:
+        L = -NDCG_approx + lambda * ||w||_1
+
+    Uses softmax to create differentiable approximation of ranking.
+    This directly optimizes the evaluation metric (NDCG).
+    """
+
+    def __init__(self, lambda_l1=0.01, max_iter=1000, random_state=42,
+                 learning_rate=0.01, temperature=1.0, k=10):
+        """
+        Initialize ApproxNDCG trainer.
+
+        Args:
+            lambda_l1: L1 regularization strength
+            max_iter: Maximum iterations
+            random_state: Random seed
+            learning_rate: Learning rate
+            temperature: Temperature for softmax (lower = sharper approximation)
+            k: Compute NDCG@k
+        """
+        super().__init__(lambda_l1, temperature, max_iter, random_state)
+        self.learning_rate = learning_rate
+        self.k = k
+
+    @property
+    def name(self) -> str:
+        return "approx_ndcg"
+
+    def _ndcg_at_k(self, scores, labels, k):
+        """
+        Compute differentiable approximation of NDCG@k.
+
+        Uses softmax weights to approximate sorted positions.
+        """
+        # Sort by scores (true ranking)
+        sorted_indices = np.argsort(-scores)
+        sorted_labels = labels[sorted_indices][:k]
+
+        # DCG
+        positions = np.arange(1, min(k, len(sorted_labels)) + 1)
+        discounts = np.log2(positions + 1)
+        dcg = np.sum(sorted_labels / discounts)
+
+        # IDCG (ideal ranking)
+        ideal_labels = np.sort(labels)[::-1][:k]
+        idcg = np.sum(ideal_labels / discounts[:len(ideal_labels)])
+
+        if idcg == 0:
+            return 0.0
+
+        return dcg / idcg
+
+    def fit(self, X_train, y_train, docs_per_query_train=None):
+        """
+        Fit model by maximizing approx NDCG.
+
+        Args:
+            X_train: Training features (n_docs, n_features)
+            y_train: Training labels (n_docs,)
+            docs_per_query_train: Array of docs per query (required)
+        """
+        if docs_per_query_train is None:
+            raise ValueError("ApproxNDCG trainer requires docs_per_query_train")
+
+        n_features = X_train.shape[1]
+        rng = np.random.RandomState(self.random_state)
+
+        # Initialize weights
+        self.weights_ = rng.randn(n_features) * 0.01
+        self.intercept_ = 0.0
+
+        # Apply temperature-scaled softmax to features
+        X_train_softmax = self._apply_temperature_softmax(X_train)
+
+        # Group documents by query
+        query_groups = []
+        doc_offset = 0
+        for n_docs in docs_per_query_train:
+            query_groups.append({
+                'X': X_train_softmax[doc_offset:doc_offset + n_docs],
+                'y': y_train[doc_offset:doc_offset + n_docs]
+            })
+            doc_offset += n_docs
+
+        # Gradient descent
+        best_weights = self.weights_.copy()
+        best_ndcg = -np.inf
+
+        for iteration in range(self.max_iter):
+            grad = np.zeros(n_features)
+            total_ndcg = 0.0
+
+            for group in query_groups:
+                X_q = group['X']
+                y_q = group['y']
+
+                # Compute scores
+                scores = X_q @ self.weights_
+
+                # Compute NDCG for this query
+                ndcg = self._ndcg_at_k(scores, y_q, self.k)
+                total_ndcg += ndcg
+
+                # Approximate gradient using finite differences
+                epsilon = 1e-5
+                for i in range(n_features):
+                    w_plus = self.weights_.copy()
+                    w_plus[i] += epsilon
+                    scores_plus = X_q @ w_plus
+                    ndcg_plus = self._ndcg_at_k(scores_plus, y_q, self.k)
+
+                    grad[i] += -(ndcg_plus - ndcg) / epsilon  # Negative because we minimize
+
+            # Average gradient
+            grad /= len(query_groups)
+
+            # Gradient step
+            self.weights_ -= self.learning_rate * grad
+
+            # Proximal step for L1
+            self.weights_ = np.sign(self.weights_) * np.maximum(
+                np.abs(self.weights_) - self.learning_rate * self.lambda_l1, 0
+            )
+
+            # Track best weights
+            avg_ndcg = total_ndcg / len(query_groups)
+            if avg_ndcg > best_ndcg:
+                best_ndcg = avg_ndcg
+                best_weights = self.weights_.copy()
+
+        # Use best weights found
+        self.weights_ = best_weights
+        return self
+
+    def predict_proba(self, X):
+        """Predict scores with temperature-scaled softmax features."""
+        if self.weights_ is None:
+            raise ValueError("Model not fitted yet. Call fit() first.")
+        X_softmax = self._apply_temperature_softmax(X)
+        scores = X_softmax @ self.weights_
+        return 1 / (1 + np.exp(-scores))
+
+
+class GroupLassoTrainer(BaseTrainer):
+    """
+    Group Lasso trainer for layer-wise sparse head selection.
+
+    Optimizes:
+        L = (1/n) * sum(BCE) + lambda * sum(||w_layer||_2)
+
+    Encourages entire layers to be selected or deselected together.
+    Discovers which layers are most important for retrieval.
+    """
+
+    def __init__(self, lambda_l1=0.01, temperature=1.0, max_iter=1000, random_state=42,
+                 num_layers=32, num_heads_per_layer=32, class_weight='balanced'):
+        """
+        Initialize Group Lasso trainer.
+
+        Args:
+            lambda_l1: Group lasso regularization strength
+            temperature: Temperature for softmax over features. Default: 1.0 (standard softmax)
+            max_iter: Maximum iterations
+            random_state: Random seed
+            num_layers: Number of layers in the model
+            num_heads_per_layer: Number of attention heads per layer
+            class_weight: Class weighting for BCE
+        """
+        super().__init__(lambda_l1, temperature, max_iter, random_state)
+        self.num_layers = num_layers
+        self.num_heads_per_layer = num_heads_per_layer
+        self.class_weight = class_weight
+
+    @property
+    def name(self) -> str:
+        return "group_lasso"
+
+    def fit(self, X_train, y_train, docs_per_query_train=None):
+        """
+        Fit model using Group Lasso.
+
+        Uses proximal gradient descent with group-wise soft thresholding.
+        """
+        n_features = X_train.shape[1]
+        rng = np.random.RandomState(self.random_state)
+
+        # Initialize weights
+        self.weights_ = rng.randn(n_features) * 0.01
+        self.intercept_ = 0.0
+
+        # Compute class weights if needed
+        if self.class_weight == 'balanced':
+            n_pos = np.sum(y_train == 1)
+            n_neg = np.sum(y_train == 0)
+            w_pos = len(y_train) / (2 * n_pos) if n_pos > 0 else 1.0
+            w_neg = len(y_train) / (2 * n_neg) if n_neg > 0 else 1.0
+            sample_weights = np.where(y_train == 1, w_pos, w_neg)
+        else:
+            sample_weights = np.ones(len(y_train))
+
+        learning_rate = 0.01
+
+        # Apply temperature-scaled softmax to features
+        X_train_softmax = self._apply_temperature_softmax(X_train)
+
+        # Proximal gradient descent
+        for iteration in range(self.max_iter):
+            # Compute predictions
+            scores = X_train_softmax @ self.weights_ + self.intercept_
+            probs = 1 / (1 + np.exp(-scores))
+
+            # BCE gradient
+            grad = X_train_softmax.T @ ((probs - y_train) * sample_weights) / len(y_train)
+
+            # Gradient step
+            self.weights_ -= learning_rate * grad
+
+            # Group-wise proximal step (block soft thresholding)
+            for layer in range(self.num_layers):
+                start_idx = layer * self.num_heads_per_layer
+                end_idx = start_idx + self.num_heads_per_layer
+
+                if end_idx <= n_features:
+                    w_layer = self.weights_[start_idx:end_idx]
+                    layer_norm = np.linalg.norm(w_layer)
+
+                    if layer_norm > 0:
+                        # Block soft thresholding
+                        shrinkage = max(0, 1 - learning_rate * self.lambda_l1 / layer_norm)
+                        self.weights_[start_idx:end_idx] = shrinkage * w_layer
+
+        return self
+
+    def predict_proba(self, X):
+        """Predict probability of positive class with temperature-scaled softmax features."""
+        if self.weights_ is None:
+            raise ValueError("Model not fitted yet. Call fit() first.")
+        X_softmax = self._apply_temperature_softmax(X)
+        scores = X_softmax @ self.weights_ + self.intercept_
+        return 1 / (1 + np.exp(-scores))
+
+    def get_layer_importance(self):
+        """
+        Get importance score for each layer.
+
+        Returns:
+            layer_importance: (num_layers,) array of L2 norms per layer
+        """
+        if self.weights_ is None:
+            raise ValueError("Model not fitted yet. Call fit() first.")
+
+        layer_importance = []
+        for layer in range(self.num_layers):
+            start_idx = layer * self.num_heads_per_layer
+            end_idx = start_idx + self.num_heads_per_layer
+
+            if end_idx <= len(self.weights_):
+                w_layer = self.weights_[start_idx:end_idx]
+                layer_importance.append(np.linalg.norm(w_layer))
+            else:
+                break
+
+        return np.array(layer_importance)
+
+
+class RankNetTrainer(BaseTrainer):
+    """
+    RankNet trainer - pairwise ranking with smooth loss.
+
+    Optimizes:
+        L = (1/n_pairs) * sum(-log(sigmoid(s_pos - s_neg))) + lambda * ||w||_1
+
+    Smooth pairwise ranking loss that's easier to optimize than hinge loss.
+    """
+
+    def __init__(self, lambda_l1=0.01, temperature=1.0, max_iter=1000, random_state=42,
+                 learning_rate=0.01):
+        """
+        Initialize RankNet trainer.
+
+        Args:
+            lambda_l1: L1 regularization strength
+            temperature: Temperature for softmax over features. Default: 1.0 (standard softmax)
+            max_iter: Maximum iterations
+            random_state: Random seed
+            learning_rate: Learning rate
+        """
+        super().__init__(lambda_l1, temperature, max_iter, random_state)
+        self.learning_rate = learning_rate
+
+    @property
+    def name(self) -> str:
+        return "ranknet"
+
+    def fit(self, X_train, y_train, docs_per_query_train=None):
+        """
+        Fit model using RankNet pairwise loss.
+
+        Args:
+            X_train: Training features
+            y_train: Training labels
+            docs_per_query_train: Array of docs per query (required)
+        """
+        if docs_per_query_train is None:
+            raise ValueError("RankNet trainer requires docs_per_query_train")
+
+        n_features = X_train.shape[1]
+        rng = np.random.RandomState(self.random_state)
+
+        # Initialize weights
+        self.weights_ = rng.randn(n_features) * 0.01
+        self.intercept_ = 0.0
+
+        # Apply temperature-scaled softmax to features
+        X_train_softmax = self._apply_temperature_softmax(X_train)
+
+        # Create pairwise training examples
+        pairs = []
+        doc_offset = 0
+        for n_docs in docs_per_query_train:
+            X_q = X_train_softmax[doc_offset:doc_offset + n_docs]
+            y_q = y_train[doc_offset:doc_offset + n_docs]
+
+            pos_indices = np.where(y_q == 1)[0]
+            neg_indices = np.where(y_q == 0)[0]
+
+            # Create all positive-negative pairs
+            for pos_idx in pos_indices:
+                for neg_idx in neg_indices:
+                    pairs.append({
+                        'x_pos': X_q[pos_idx],
+                        'x_neg': X_q[neg_idx]
+                    })
+
+            doc_offset += n_docs
+
+        if len(pairs) == 0:
+            raise ValueError("No positive-negative pairs found")
+
+        # Gradient descent
+        for iteration in range(self.max_iter):
+            grad = np.zeros(n_features)
+
+            for pair in pairs:
+                x_pos = pair['x_pos']
+                x_neg = pair['x_neg']
+
+                # Score difference
+                s_diff = (x_pos - x_neg) @ self.weights_
+
+                # Sigmoid
+                sigmoid = 1 / (1 + np.exp(-s_diff))
+
+                # Gradient: -(1 - sigmoid) * (x_pos - x_neg)
+                grad += -(1 - sigmoid) * (x_pos - x_neg)
+
+            # Average over pairs
+            grad /= len(pairs)
+
+            # Gradient step
+            self.weights_ -= self.learning_rate * grad
+
+            # Proximal step for L1
+            self.weights_ = np.sign(self.weights_) * np.maximum(
+                np.abs(self.weights_) - self.learning_rate * self.lambda_l1, 0
+            )
+
+        return self
+
+    def predict_proba(self, X):
+        """Predict scores with temperature-scaled softmax features."""
+        if self.weights_ is None:
+            raise ValueError("Model not fitted yet. Call fit() first.")
+        X_softmax = self._apply_temperature_softmax(X)
+        scores = X_softmax @ self.weights_
+        return 1 / (1 + np.exp(-scores))
 
 
 class InfoNCETrainer(BaseTrainer):
@@ -208,11 +880,10 @@ class InfoNCETrainer(BaseTrainer):
             max_iter: Maximum iterations for optimization
             random_state: Random seed
             learning_rate: Learning rate for gradient descent
-            temperature: Temperature for softmax scaling
+            temperature: Temperature for softmax scaling over features. Default: 1.0 (standard softmax)
         """
-        super().__init__(lambda_l1, max_iter, random_state)
+        super().__init__(lambda_l1, temperature, max_iter, random_state)
         self.learning_rate = learning_rate
-        self.temperature = temperature
 
     @property
     def name(self) -> str:
@@ -237,12 +908,15 @@ class InfoNCETrainer(BaseTrainer):
         self.weights_ = rng.randn(n_features) * 0.01
         self.intercept_ = 0.0
 
+        # Apply temperature-scaled softmax to features (like CoRe)
+        X_train_softmax = self._apply_temperature_softmax(X_train)
+
         # Group documents by query
         query_groups = []
         doc_offset = 0
         for n_docs in docs_per_query_train:
             query_groups.append({
-                'X': X_train[doc_offset:doc_offset + n_docs],
+                'X': X_train_softmax[doc_offset:doc_offset + n_docs],
                 'y': y_train[doc_offset:doc_offset + n_docs]
             })
             doc_offset += n_docs
@@ -255,8 +929,8 @@ class InfoNCETrainer(BaseTrainer):
                 X_q = group['X']
                 y_q = group['y']
 
-                # Compute scores
-                scores = X_q @ self.weights_ / self.temperature
+                # Compute scores (features already have temperature-scaled softmax applied)
+                scores = X_q @ self.weights_
 
                 # Softmax probabilities
                 scores_exp = np.exp(scores - scores.max())  # Numerical stability
@@ -265,7 +939,7 @@ class InfoNCETrainer(BaseTrainer):
                 # Gradient: sum over docs of (prob - target) * x
                 # For InfoNCE, target is 1 for positive docs, 0 for negative
                 targets = y_q / max(y_q.sum(), 1)  # Normalize targets
-                grad += X_q.T @ (probs - targets) / self.temperature
+                grad += X_q.T @ (probs - targets)
 
             # Average gradient
             grad /= len(query_groups)
@@ -281,10 +955,11 @@ class InfoNCETrainer(BaseTrainer):
         return self
 
     def predict_proba(self, X):
-        """Predict scores (higher = more likely positive)."""
+        """Predict scores with temperature-scaled softmax features."""
         if self.weights_ is None:
             raise ValueError("Model not fitted yet. Call fit() first.")
-        scores = X @ self.weights_
+        X_softmax = self._apply_temperature_softmax(X)
+        scores = X_softmax @ self.weights_
         # Convert to probabilities using sigmoid
         return 1 / (1 + np.exp(-scores))
 
@@ -292,7 +967,12 @@ class InfoNCETrainer(BaseTrainer):
 # Registry of available trainers
 TRAINERS = {
     'bce': BCETrainer,
+    'bce_temp': BCEWithTemperatureTrainer,
     'infonce': InfoNCETrainer,
+    'hinge': HingeLossTrainer,
+    'approx_ndcg': ApproxNDCGTrainer,
+    'group_lasso': GroupLassoTrainer,
+    'ranknet': RankNetTrainer,
 }
 
 

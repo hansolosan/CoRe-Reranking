@@ -19,6 +19,21 @@
 # limitations under the License.
 
 # Adapted from transformers v0.44.1
+"""
+PyTorch Llama model with custom attention caching.
+
+This module extends the standard HuggingFace Llama implementation to support
+caching query states in addition to key-value states. This enables external
+computation of attention weights for head detection and reranking.
+
+Key modifications:
+- LlamaAttention.forward: Checks for DynamicCacheWithQuery and caches query states
+  (around line 435)
+- LlamaFlashAttention2.forward: Same query caching logic for Flash Attention 2
+  (around line 545)
+
+All other code is unchanged from HuggingFace transformers v0.44.1.
+"""
 import math
 from typing import List, Optional, Tuple, Union
 

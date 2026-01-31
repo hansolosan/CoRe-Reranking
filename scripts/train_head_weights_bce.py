@@ -125,7 +125,7 @@ def split_by_base_query(X, y, docs_per_query, val_split=0.2, random_state=42,
                             Only used if query_to_base is None.
 
     Returns:
-        X_train, X_val, y_train, y_val, train_query_indices, val_query_indices, n_base_queries
+        X_train, X_val, y_train, y_val, docs_per_query_train, docs_per_query_val, train_query_indices, val_query_indices, n_base_queries
     """
     n_queries = len(docs_per_query)
 
@@ -164,9 +164,11 @@ def split_by_base_query(X, y, docs_per_query, val_split=0.2, random_state=42,
         else:
             train_query_indices.append(q_idx)
 
-    # Collect document indices for train/val
+    # Collect document indices and docs_per_query for train/val
     train_doc_indices = []
     val_doc_indices = []
+    train_docs_per_query = []
+    val_docs_per_query = []
 
     doc_offset = 0
     for q_idx in range(n_queries):
@@ -176,21 +178,25 @@ def split_by_base_query(X, y, docs_per_query, val_split=0.2, random_state=42,
         base_idx = query_to_base[q_idx]
         if base_idx in val_base_indices:
             val_doc_indices.extend(doc_indices)
+            val_docs_per_query.append(n_docs)
         else:
             train_doc_indices.extend(doc_indices)
+            train_docs_per_query.append(n_docs)
 
         doc_offset += n_docs
 
     # Create train/val splits
     train_doc_indices = np.array(train_doc_indices)
     val_doc_indices = np.array(val_doc_indices)
+    train_docs_per_query = np.array(train_docs_per_query, dtype=np.int32)
+    val_docs_per_query = np.array(val_docs_per_query, dtype=np.int32)
 
     X_train = X[train_doc_indices]
     X_val = X[val_doc_indices]
     y_train = y[train_doc_indices]
     y_val = y[val_doc_indices]
 
-    return X_train, X_val, y_train, y_val, train_query_indices, val_query_indices, n_base_queries
+    return X_train, X_val, y_train, y_val, train_docs_per_query, val_docs_per_query, train_query_indices, val_query_indices, n_base_queries
 
 
 def kfold_by_base_query(X, y, docs_per_query, n_folds=5, random_state=42,
@@ -211,7 +217,7 @@ def kfold_by_base_query(X, y, docs_per_query, n_folds=5, random_state=42,
         positions_per_query: Number of position variations per base query
 
     Yields:
-        (X_train, X_val, y_train, y_val, fold_idx, n_base_queries) for each fold
+        (X_train, X_val, y_train, y_val, docs_per_query_train, docs_per_query_val, fold_idx, n_base_queries) for each fold
     """
     n_queries = len(docs_per_query)
 
@@ -244,9 +250,11 @@ def kfold_by_base_query(X, y, docs_per_query, n_folds=5, random_state=42,
 
         val_base_indices = set(base_query_indices[start:end])
 
-        # Collect document indices for train/val
+        # Collect document indices and docs_per_query for train/val
         train_doc_indices = []
         val_doc_indices = []
+        train_docs_per_query = []
+        val_docs_per_query = []
 
         for q_idx in range(n_queries):
             base_idx = query_to_base[q_idx]
@@ -256,24 +264,28 @@ def kfold_by_base_query(X, y, docs_per_query, n_folds=5, random_state=42,
 
             if base_idx in val_base_indices:
                 val_doc_indices.extend(doc_indices)
+                val_docs_per_query.append(docs_per_query[q_idx])
             else:
                 train_doc_indices.extend(doc_indices)
+                train_docs_per_query.append(docs_per_query[q_idx])
 
         train_doc_indices = np.array(train_doc_indices)
         val_doc_indices = np.array(val_doc_indices)
+        train_docs_per_query = np.array(train_docs_per_query, dtype=np.int32)
+        val_docs_per_query = np.array(val_docs_per_query, dtype=np.int32)
 
         X_train = X[train_doc_indices]
         X_val = X[val_doc_indices]
         y_train = y[train_doc_indices]
         y_val = y[val_doc_indices]
 
-        yield X_train, X_val, y_train, y_val, fold_idx, n_base_queries
+        yield X_train, X_val, y_train, y_val, train_docs_per_query, val_docs_per_query, fold_idx, n_base_queries
 
         start = end
 
 
 def train_single_lambda_cv(lambda_l1, X, y, docs_per_query, n_folds, num_layers, num_heads,
-                           max_iter, query_to_base, positions_per_query, loss='bce'):
+                           max_iter, query_to_base, positions_per_query, loss='bce', temperature=1.0):
     """
     Train a single lambda value with k-fold cross-validation.
 
@@ -282,7 +294,7 @@ def train_single_lambda_cv(lambda_l1, X, y, docs_per_query, n_folds, num_layers,
     """
     fold_metrics = []
 
-    for X_train, X_val, y_train, y_val, fold_idx, n_base_queries in kfold_by_base_query(
+    for X_train, X_val, y_train, y_val, docs_per_query_train, docs_per_query_val, fold_idx, n_base_queries in kfold_by_base_query(
         X, y, docs_per_query, n_folds=n_folds, random_state=42,
         query_to_base=query_to_base, positions_per_query=positions_per_query
     ):
@@ -294,7 +306,9 @@ def train_single_lambda_cv(lambda_l1, X, y, docs_per_query, n_folds, num_layers,
         # Train model
         trainer, metrics = train_model(
             X_train_scaled, y_train, X_val_scaled, y_val,
-            lambda_l1=lambda_l1, max_iter=max_iter, loss=loss
+            lambda_l1=lambda_l1, max_iter=max_iter, loss=loss,
+            docs_per_query_train=docs_per_query_train,
+            temperature=temperature
         )
         fold_metrics.append(metrics)
 
@@ -311,7 +325,9 @@ def train_single_lambda_cv(lambda_l1, X, y, docs_per_query, n_folds, num_layers,
     X_scaled = scaler.fit_transform(X)
     # For final model, we use a dummy split (train on all, evaluate on all)
     final_trainer, _ = train_model(
-        X_scaled, y, X_scaled, y, lambda_l1=lambda_l1, max_iter=max_iter, loss=loss
+        X_scaled, y, X_scaled, y, lambda_l1=lambda_l1, max_iter=max_iter, loss=loss,
+        docs_per_query_train=docs_per_query,
+        temperature=temperature
     )
     weights = final_trainer.get_weights()
     top_heads, all_heads = analyze_weights(weights, num_layers, num_heads, top_k=20)
@@ -444,7 +460,7 @@ def convert_to_native(obj):
 
 def save_results(output_dir, lambda_l1, num_samples, metrics, top_heads, all_heads, command,
                  n_train_docs=None, n_val_docs=None, n_train_base_queries=None, n_val_base_queries=None,
-                 loss='bce', llm_name=None, output_template=None):
+                 loss='bce', llm_name=None, output_template=None, temperature=1.0):
     """Save results for a single lambda value.
 
     Args:
@@ -463,6 +479,7 @@ def save_results(output_dir, lambda_l1, num_samples, metrics, top_heads, all_hea
         llm_name: LLM name (for template substitution)
         output_template: Optional output file template with placeholders:
                         {lambda}, {n}, {loss}, {llm}
+        temperature: Temperature value used for training (for bce_temp and infonce)
     """
     if output_template:
         # Substitute placeholders in template
@@ -482,6 +499,7 @@ def save_results(output_dir, lambda_l1, num_samples, metrics, top_heads, all_hea
         'timestamp': datetime.now().isoformat(),
         'loss': loss,
         'lambda_l1': float(lambda_l1),
+        'temperature': float(temperature),
         'num_samples': int(num_samples),
         'metrics': convert_to_native(metrics),
         'split_info': {
@@ -504,7 +522,7 @@ def save_results(output_dir, lambda_l1, num_samples, metrics, top_heads, all_hea
 
 
 def train_single_lambda(lambda_l1, X_train, y_train, X_val, y_val, num_layers, num_heads,
-                        max_iter=1000, loss='bce'):
+                        max_iter=1000, loss='bce', docs_per_query_train=None, temperature=1.0):
     """
     Train a single model for one lambda value. Designed for parallel execution.
 
@@ -513,7 +531,9 @@ def train_single_lambda(lambda_l1, X_train, y_train, X_val, y_val, num_layers, n
     """
     trainer, metrics = train_model(
         X_train, y_train, X_val, y_val,
-        lambda_l1=lambda_l1, max_iter=max_iter, loss=loss
+        lambda_l1=lambda_l1, max_iter=max_iter, loss=loss,
+        docs_per_query_train=docs_per_query_train,
+        temperature=temperature
     )
     weights = trainer.get_weights()
     top_heads, all_heads = analyze_weights(weights, num_layers, num_heads, top_k=20)
@@ -549,7 +569,9 @@ def main():
     parser.add_argument('--cv', type=int, default=None,
                         help='Number of cross-validation folds. If set, uses k-fold CV instead of single split.')
     parser.add_argument('--temp', type=float, default=0.001,
-                        help='Temperature used for CoRe head detection (for comparison)')
+                        help='Temperature for scaling: (1) used in bce_temp trainer for logit scaling, '
+                             '(2) used for CoRe head detection comparison. Lower values (e.g., 0.001) '
+                             'make predictions sharper. Default matches CoRe: 0.001')
     parser.add_argument('--save_best_only', action='store_true',
                         help='Only save the best model (default: save all lambda values)')
     parser.add_argument('--n_jobs', type=int, default=1,
@@ -658,7 +680,7 @@ def main():
                 delayed(train_single_lambda_cv)(
                     lambda_l1, X, y, docs_per_query, args.cv,
                     num_layers, num_heads, args.max_iter,
-                    query_to_base, 5, args.loss
+                    query_to_base, 5, args.loss, args.temp
                 )
                 for lambda_l1 in args.lambda_l1
             )
@@ -670,7 +692,7 @@ def main():
                 result = train_single_lambda_cv(
                     lambda_l1, X, y, docs_per_query, args.cv,
                     num_layers, num_heads, args.max_iter,
-                    query_to_base, 5, args.loss
+                    query_to_base, 5, args.loss, args.temp
                 )
                 all_results.append(result)
 
@@ -712,7 +734,8 @@ def main():
                     n_val_base_queries=0,
                     loss=args.loss,
                     llm_name=args.llm,
-                    output_template=args.output
+                    output_template=args.output,
+                    temperature=args.temp
                 )
                 if not args.save_best_only:
                     print(f"  Saved lambda={result['lambda_l1']} to {output_file}")
@@ -721,7 +744,7 @@ def main():
 
     else:
         # Single train/val split mode (original behavior)
-        X_train, X_val, y_train, y_val, train_q_idx, val_q_idx, n_base_queries = split_by_base_query(
+        X_train, X_val, y_train, y_val, docs_per_query_train, docs_per_query_val, train_q_idx, val_q_idx, n_base_queries = split_by_base_query(
             X, y, docs_per_query, val_split=args.val_split, random_state=42,
             query_to_base=query_to_base, positions_per_query=5
         )
@@ -756,7 +779,7 @@ def main():
             all_results = Parallel(n_jobs=n_jobs, verbose=10)(
                 delayed(train_single_lambda)(
                     lambda_l1, X_train_scaled, y_train, X_val_scaled, y_val,
-                    num_layers, num_heads, args.max_iter, args.loss
+                    num_layers, num_heads, args.max_iter, args.loss, docs_per_query_train, args.temp
                 )
                 for lambda_l1 in args.lambda_l1
             )
@@ -779,7 +802,7 @@ def main():
             for lambda_l1 in args.lambda_l1:
                 result = train_single_lambda(
                     lambda_l1, X_train_scaled, y_train, X_val_scaled, y_val,
-                    num_layers, num_heads, args.max_iter, args.loss
+                    num_layers, num_heads, args.max_iter, args.loss, docs_per_query_train, args.temp
                 )
                 all_results.append(result)
 
@@ -807,7 +830,8 @@ def main():
                     n_val_base_queries=n_val_base,
                     loss=args.loss,
                     llm_name=args.llm,
-                    output_template=args.output
+                    output_template=args.output,
+                    temperature=args.temp
                 )
                 if not args.save_best_only:
                     print(f"  Saved lambda={result['lambda_l1']} to {output_file}")

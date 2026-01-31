@@ -13,6 +13,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+PyTorch Granite model with custom attention caching.
+
+This module extends the standard HuggingFace Granite implementation to support
+caching query states in addition to key-value states. This enables external
+computation of attention weights for head detection and reranking.
+
+Key modifications:
+- GraniteAttention.forward: Checks for DynamicCacheWithQuery and caches query states
+  (around line 319)
+- GraniteFlashAttention2.forward: Same query caching logic for Flash Attention 2
+  (around line 406)
+
+All other code is unchanged from HuggingFace transformers.
+"""
 from typing import List, Optional, Tuple, Union
 
 import torch

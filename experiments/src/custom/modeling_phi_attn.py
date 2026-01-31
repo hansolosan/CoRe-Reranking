@@ -13,7 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PyTorch Phi-3 model."""
+"""
+PyTorch Phi-3 model with custom attention caching.
+
+This module extends the standard HuggingFace Phi-3 implementation to support
+caching query states in addition to key-value states. This enables external
+computation of attention weights for head detection and reranking.
+
+Key modifications:
+- Phi3Attention.forward: Checks for DynamicCacheWithQuery and caches query states
+  (around line 451)
+- Phi3FlashAttention2.forward: Same query caching logic for Flash Attention 2
+  (around line 584)
+
+All other code is unchanged from HuggingFace transformers.
+"""
 
 import math
 import warnings

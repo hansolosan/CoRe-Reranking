@@ -1,3 +1,10 @@
+"""
+Calibrated Reranker for Document Retrieval.
+
+This module implements a reranker that uses attention weights from selected
+retrieval heads to score and rank documents. Supports calibration using
+content-free queries and batched inference.
+"""
 import math
 import transformers
 import torch
@@ -5,8 +12,39 @@ from torch.nn.utils.rnn import pad_sequence
 from .custom.custom_cache import DynamicCacheWithQuery
 
 class Reranker():
+    """
+    Calibrated Document Reranker using Attention Weights.
+
+    Reranks documents using attention weights from selected retrieval heads.
+    Implements calibration via a content-free query ("N/A") to remove model bias,
+    computing calibrated_score = score(query) - score("N/A"). Supports both single
+    and batched inference.
+
+    Attributes:
+        tokenizer: HuggingFace tokenizer with left padding for batched inference
+        llm: Custom LLM with attention caching capabilities
+        prompt_prefix: Model-specific prompt prefix (e.g., '[INST]' for Mistral)
+        prompt_suffix: Model-specific prompt suffix (e.g., '[/INST]' for Mistral)
+        retrieval_instruction: Instruction text before documents
+        retrieval_instruction_late: Instruction text before query
+        off_set: Tokenization offset (1 for Mistral, 0 for others)
+        num_layer: Number of transformer layers
+        head_set: List of (layer, head) tuples for retrieval heads. If None, uses all heads.
+        batch_size: Batch size for inference (default: 1)
+    """
 
     def __init__(self, llm_name, head_set=None, prune=0.0, batch_size=1) -> None:
+        """
+        Initialize the calibrated reranker.
+
+        Args:
+            llm_name: HuggingFace model name/path (e.g., 'mistralai/Mistral-7B-Instruct-v0.2')
+            head_set: List of (layer_idx, head_idx) tuples specifying which retrieval
+                      heads to use. If None, uses all heads (default: None)
+            prune: Layer pruning ratio [0, 1). Removes top layers from model
+                   (default: 0.0, no pruning). E.g., prune=0.3 removes top 30% of layers.
+            batch_size: Batch size for inference (default: 1)
+        """
         self.batch_size = batch_size
 
         # set up the base LLM
@@ -66,6 +104,25 @@ class Reranker():
         self.head_set = head_set
 
     def rerank(self, query, documents):
+        """
+        Rerank documents using calibrated attention scores.
+
+        Performs two forward passes:
+        1. With actual query to get attention scores
+        2. With content-free query ("N/A") for calibration
+
+        Calibrated score = score(query) - score("N/A")
+        Applies token-level filtering: keeps tokens where calibrated_score > mean - 2*std
+
+        Args:
+            query: Query text string
+            documents: List of document text strings to rerank
+
+        Returns:
+            tuple: (sorted_doc_ids, sorted_doc_scores) where:
+                - sorted_doc_ids: List of document indices sorted by score (descending)
+                - sorted_doc_scores: List of corresponding scores
+        """
         # FP with query
         llm_prompt, doc_span, query_start_idx, query_end_idx = self.prepare_input_for_document_retrieval(query, documents)
         tok_scores, kv_cache = self.score_documents(llm_prompt, doc_span, query_start_idx, query_end_idx, return_cache=True)
@@ -102,15 +159,22 @@ class Reranker():
 
     def rerank_batch(self, queries_and_documents):
         """
-        Rerank multiple query-document pairs in a single batched forward pass.
+        Rerank multiple query-document pairs in a batched forward pass.
+
+        Processes multiple queries in parallel using batched inference, applying
+        calibration via content-free queries. More efficient than calling rerank()
+        multiple times when processing many queries.
 
         Args:
             queries_and_documents: List of (query, documents) tuples where:
                 - query: str, the query text
-                - documents: List[str], the documents to rerank
+                - documents: List[str], the documents to rerank for this query
 
         Returns:
-            List of (sorted_doc_ids, sorted_doc_scores) tuples for each query
+            List of (sorted_doc_ids, sorted_doc_scores) tuples, one per query.
+            Each tuple contains:
+                - sorted_doc_ids: List of document indices sorted by score (descending)
+                - sorted_doc_scores: List of corresponding calibrated scores
         """
         batch_size = len(queries_and_documents)
         if batch_size == 0:
@@ -193,14 +257,19 @@ class Reranker():
         """
         Score documents for multiple queries in a batched forward pass.
 
+        Processes multiple prompts in parallel using batched inference with left padding.
+        Adjusts token indices to account for padding offsets.
+
         Args:
-            llm_inputs: List of prompt strings
-            doc_spans: List of doc_span lists (one per query)
-            query_start_tok_idxs: List of query start indices
-            query_end_tok_idxs: List of query end indices
+            llm_inputs: List of formatted prompt strings, one per query
+            doc_spans: List of doc_span lists, one per query. Each doc_span is a list
+                       of (start_idx, end_idx) tuples for documents in that query.
+            query_start_tok_idxs: List of query start token indices (before padding adjustment)
+            query_end_tok_idxs: List of query end token indices (before padding adjustment)
 
         Returns:
-            List of per_doc_results lists (one per query)
+            List of per_doc_results lists, one per query. Each per_doc_results is a list
+            of torch.Tensors containing attention scores for each document's tokens.
         """
         batch_size = len(llm_inputs)
 
@@ -301,6 +370,27 @@ class Reranker():
             return_cache=False,
             kv_cache=None,
         ):
+        """
+        Score documents for a single query using attention weights.
+
+        Runs a forward pass through the LLM, extracts attention weights from selected
+        retrieval heads (or all heads if head_set is None), and computes per-document
+        attention scores.
+
+        Args:
+            llm_input: Formatted prompt string including documents and query
+            doc_span: List of (start_idx, end_idx) tuples for document token spans
+            query_start_tok_idx: Token index where query starts
+            query_end_tok_idx: Token index where query ends
+            context_start_idx: Token index to start processing from. Used when reusing
+                               KV cache from a previous forward pass (default: 0)
+            return_cache: If True, returns KV cache along with scores (default: False)
+            kv_cache: Optional pre-computed KV cache to reuse (default: None)
+
+        Returns:
+            If return_cache=False: List of torch.Tensors with attention scores per document
+            If return_cache=True: Tuple (per_doc_results, kv_cache)
+        """
 
         tokenized_input = self.tokenizer(llm_input,return_tensors='pt').to(self.llm.device)
         _input_ids = tokenized_input.input_ids[:, context_start_idx:]
@@ -365,6 +455,20 @@ class Reranker():
             return per_doc_results
 
     def get_attn_all(self, key_states, query_states):
+        """
+        Compute attention weights using all heads.
+
+        Computes attention for a single layer: softmax(QK^T / sqrt(d_k)) with causal masking.
+        Supports Grouped Query Attention (GQA).
+
+        Args:
+            key_states: Key states for one layer, shape (num_kv_heads, seq_len, head_dim)
+            query_states: Query states for one layer, shape (num_heads, q_len, head_dim)
+
+        Returns:
+            torch.Tensor: Attention weights of shape (num_heads, q_len, seq_len).
+                          Values are in [0, 1] and sum to 1 over seq_len dimension.
+        """
         num_heads, q_len, head_dim = query_states.size()
         num_key_value_heads = key_states.size(0)
         num_key_value_groups = num_heads // num_key_value_heads
@@ -394,6 +498,20 @@ class Reranker():
         return attn_weights
 
     def get_attn_head(self, key_states, query_states):
+        """
+        Compute attention weights using only selected retrieval heads.
+
+        Extracts specified heads from all layers, then computes attention for those heads only.
+        More efficient than get_attn_all when using a small subset of heads.
+
+        Args:
+            key_states: Key states for all layers, shape (num_layers, num_kv_heads, seq_len, head_dim)
+            query_states: Query states for all layers, shape (num_layers, num_heads, q_len, head_dim)
+
+        Returns:
+            torch.Tensor: Attention weights for selected heads, shape (num_selected_heads, q_len, seq_len).
+                          Values are in [0, 1] and sum to 1 over seq_len dimension.
+        """
         num_layers, num_heads, q_len, head_dim = query_states.size()
         num_key_value_heads = key_states.size(1)
         num_key_value_groups = num_heads // num_key_value_heads
@@ -430,6 +548,27 @@ class Reranker():
         return attn_weights
 
     def prepare_input_for_document_retrieval(self, query, documents):
+        """
+        Prepare formatted prompt and compute token spans for documents and query.
+
+        Formats the prompt with model-specific prefixes/suffixes following the pattern:
+        [prefix] Here are some paragraphs:
+        [document 1] <doc1_text>
+        [document 2] <doc2_text>
+        ...
+        Please find information relevant to: <query_text> [suffix]
+
+        Args:
+            query: Query text string
+            documents: List of document text strings
+
+        Returns:
+            tuple: (llm_prompt, doc_span, query_start_idx, query_end_idx) where:
+                - llm_prompt: Full formatted prompt string
+                - doc_span: List of (start_idx, end_idx) tuples for document token spans
+                - query_start_idx: Token index where query starts
+                - query_end_idx: Token index where query ends
+        """
         doc_span = []
         query_start_idx = None
         query_end_idx = None

@@ -20,7 +20,21 @@
 
 
 # Adapted from transformers v0.44.1
-"""PyTorch Mistral model."""
+"""
+PyTorch Mistral model with custom attention caching.
+
+This module extends the standard HuggingFace Mistral implementation to support
+caching query states in addition to key-value states. This enables external
+computation of attention weights for head detection and reranking.
+
+Key modifications:
+- MistralAttention.forward: Checks for DynamicCacheWithQuery and caches query states
+  (lines 241-246)
+- MistralFlashAttention2.forward: Same query caching logic for Flash Attention 2
+  (lines 360-367)
+
+All other code is unchanged from HuggingFace transformers v0.44.1.
+"""
 
 import math
 from typing import List, Optional, Tuple, Union
