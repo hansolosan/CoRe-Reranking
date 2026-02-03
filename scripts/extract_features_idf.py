@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import transformers
 from extract_head_features import HFFeatureExtractor, open_file, detect_input_format, LLM_NAMES
-from utils import log_command
+from utils import log_command, parse_args_with_config
 
 # Common English stopwords
 STOPWORDS = {
@@ -467,6 +467,266 @@ class IDFFeatureExtractor(HFFeatureExtractor):
 
         return features
 
+    def _aggregate_with_filter(self, attn_weights, doc_spans, full_input_ids):
+        """
+        Aggregate attention weights over document tokens with filtering.
+
+        Args:
+            attn_weights: (num_layer, num_head, seq_len) attention weights
+            doc_spans: List of (start, end) tuples for each document
+            full_input_ids: Full input token IDs tensor
+
+        Returns:
+            features: (num_docs, num_layer * num_head) array
+        """
+        num_docs = len(doc_spans)
+        features = np.zeros((num_docs, self.num_layer * self.num_head), dtype=np.float32)
+
+        for doc_idx, (start, end) in enumerate(doc_spans):
+            doc_token_ids = full_input_ids[start:end].cpu().numpy()
+
+            if self.filter_mode == 'stopwords':
+                mask = torch.tensor(
+                    [1.0 if tid not in self.stopword_ids else 0.0 for tid in doc_token_ids],
+                    device=attn_weights.device
+                )
+                doc_attn = attn_weights[:, :, start:end]
+                masked_attn = doc_attn * mask.unsqueeze(0).unsqueeze(0)
+                doc_scores = masked_attn.sum(-1)
+
+            elif self.filter_mode == 'idf':
+                idf_weights = torch.tensor(
+                    [self.token_idf.get(tid, 1.0) for tid in doc_token_ids],
+                    device=attn_weights.device
+                )
+                doc_attn = attn_weights[:, :, start:end]
+                weighted_attn = doc_attn * idf_weights.unsqueeze(0).unsqueeze(0)
+                doc_scores = weighted_attn.sum(-1)
+
+            else:
+                doc_scores = attn_weights[:, :, start:end].sum(-1)
+
+            features[doc_idx] = doc_scores.cpu().numpy().flatten()
+
+        return features
+
+    def extract_features_batch(self, queries, documents_list, max_doc_tokens=300, max_query_tokens=None):
+        """
+        Extract attention features for a batch of queries with IDF/stopword filtering.
+
+        Args:
+            queries: list of query texts
+            documents_list: list of document lists (one per query)
+            max_doc_tokens: maximum tokens per document
+            max_query_tokens: maximum tokens for query (truncate if longer)
+
+        Returns:
+            list of features arrays, one per query
+        """
+        if self.filter_mode == 'none':
+            return super().extract_features_batch(queries, documents_list, max_doc_tokens, max_query_tokens)
+
+        batch_size = len(queries)
+        if batch_size == 0:
+            return []
+
+        # Prepare all prompts
+        all_prompts = []
+        all_prompts_na = []
+        all_doc_spans = []
+        all_query_spans = []
+        all_query_spans_na = []
+        all_truncated_docs = []
+
+        for query, documents in zip(queries, documents_list):
+            if max_query_tokens is not None:
+                query_words = query.split()
+                if len(query_words) > max_query_tokens:
+                    query = ' '.join(query_words[:max_query_tokens])
+
+            truncated_docs = []
+            for doc in documents:
+                text = doc.get('paragraph_text', '')
+                words = text.split()[:max_doc_tokens]
+                truncated_docs.append({'paragraph_text': ' '.join(words)})
+            all_truncated_docs.append(truncated_docs)
+
+            prompt, doc_spans, query_span = self.prepare_input(query, truncated_docs)
+            all_prompts.append(prompt)
+            all_doc_spans.append(doc_spans)
+            all_query_spans.append(query_span)
+
+            if self.calibrate:
+                prompt_na, _, query_span_na = self.prepare_input('N/A', truncated_docs)
+                all_prompts_na.append(prompt_na)
+                all_query_spans_na.append(query_span_na)
+
+        # Tokenize all prompts
+        tokenized = self.tokenizer(
+            all_prompts,
+            return_tensors='pt',
+            padding=True,
+            return_attention_mask=True
+        ).to(self.llm.device)
+
+        input_ids = tokenized.input_ids
+
+        input_ids_na = None
+        if self.calibrate:
+            tokenized_na = self.tokenizer(
+                all_prompts_na,
+                return_tensors='pt',
+                padding=True,
+                return_attention_mask=True
+            ).to(self.llm.device)
+            input_ids_na = tokenized_na.input_ids
+
+        # Adjust spans for padding
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+
+        adjusted_query_spans = []
+        adjusted_query_spans_na = []
+        adjusted_doc_spans = []
+        pad_offsets = []
+
+        for b in range(batch_size):
+            seq = input_ids[b]
+            pad_offset = 0
+            for t in seq:
+                if t == pad_token_id:
+                    pad_offset += 1
+                else:
+                    break
+            pad_offsets.append(pad_offset)
+
+            q_start, q_end = all_query_spans[b]
+            adjusted_query_spans.append((q_start + pad_offset, q_end + pad_offset))
+
+            adj_doc_spans = [(d_start + pad_offset, d_end + pad_offset)
+                             for d_start, d_end in all_doc_spans[b]]
+            adjusted_doc_spans.append(adj_doc_spans)
+
+            if self.calibrate:
+                seq_na = input_ids_na[b]
+                pad_offset_na = 0
+                for t in seq_na:
+                    if t == pad_token_id:
+                        pad_offset_na += 1
+                    else:
+                        break
+
+                q_start_na, q_end_na = all_query_spans_na[b]
+                adjusted_query_spans_na.append((q_start_na + pad_offset_na, q_end_na + pad_offset_na))
+
+        # Process each sample
+        all_features = []
+
+        for b in range(batch_size):
+            b_input_ids = input_ids[b:b+1]
+            full_input_ids = input_ids[b]
+            q_start, q_end = adjusted_query_spans[b]
+            _query_indices = list(range(q_start, q_end + 1))
+            kv_cache = self.DynamicCacheWithQuery(query_indices=_query_indices)
+
+            with torch.no_grad():
+                output = self.llm(
+                    input_ids=b_input_ids,
+                    use_cache=True,
+                    past_key_values=kv_cache,
+                    output_attentions=True
+                )
+            kv_cache = output.past_key_values
+
+            # Collect key and query caches
+            all_key_cache = []
+            all_query_cache = []
+            for i in range(self.num_layer):
+                all_key_cache.append(kv_cache.key_cache[i][:, :, :q_end + 1])
+                all_query_cache.append(kv_cache.query_cache[i])
+            all_key_cache = torch.stack(all_key_cache)
+            all_query_cache = torch.stack(all_query_cache)
+
+            del output
+            torch.cuda.empty_cache()
+
+            # Compute attention weights
+            attn_weights = self._get_attn_weights(all_key_cache, all_query_cache).to('cuda').squeeze(1)
+            del all_key_cache, all_query_cache
+            torch.cuda.empty_cache()
+
+            attn_weights = attn_weights.mean(-2)  # (num_layer, num_head, seq_len)
+
+            # Extract document-level scores with filtering
+            doc_spans = adjusted_doc_spans[b]
+            features = self._aggregate_with_filter(attn_weights, doc_spans, full_input_ids)
+
+            del attn_weights
+            torch.cuda.empty_cache()
+
+            # Calibration with N/A
+            if self.calibrate:
+                for i in range(len(kv_cache.key_cache)):
+                    kv_cache.key_cache[i] = kv_cache.key_cache[i][:, :, :q_start, :]
+                    kv_cache.value_cache[i] = kv_cache.value_cache[i][:, :, :q_start, :]
+                kv_cache._seen_tokens = q_start
+
+                q_start_na, q_end_na = adjusted_query_spans_na[b]
+                na_input_slice = input_ids_na[b:b+1, q_start_na:]
+
+                na_query_indices = list(range(0, q_end_na - q_start_na + 1))
+                kv_cache.query_cache = []
+                kv_cache._query_indices = na_query_indices
+
+                with torch.no_grad():
+                    output_na = self.llm(
+                        input_ids=na_input_slice,
+                        use_cache=True,
+                        past_key_values=kv_cache,
+                        output_attentions=True
+                    )
+                kv_cache_na = output_na.past_key_values
+
+                na_total_end = q_start + (q_end_na - q_start_na + 1)
+
+                all_key_cache_na = []
+                all_query_cache_na = []
+                for i in range(self.num_layer):
+                    all_key_cache_na.append(kv_cache_na.key_cache[i][:, :, :na_total_end])
+                    all_query_cache_na.append(kv_cache_na.query_cache[i])
+                all_key_cache_na = torch.stack(all_key_cache_na)
+                all_query_cache_na = torch.stack(all_query_cache_na)
+
+                del output_na
+                torch.cuda.empty_cache()
+
+                attn_weights_na = self._get_attn_weights(all_key_cache_na, all_query_cache_na).to('cuda').squeeze(1)
+                del all_key_cache_na, all_query_cache_na
+                torch.cuda.empty_cache()
+
+                attn_weights_na = attn_weights_na.mean(-2)
+
+                # Use same doc_spans for N/A (positions match)
+                features_na = self._aggregate_with_filter(attn_weights_na, doc_spans, full_input_ids)
+
+                features = features - features_na
+
+                del attn_weights_na, kv_cache_na
+                torch.cuda.empty_cache()
+
+            del kv_cache
+            torch.cuda.empty_cache()
+
+            all_features.append(features)
+
+        del tokenized, input_ids
+        if self.calibrate:
+            del tokenized_na, input_ids_na
+        torch.cuda.empty_cache()
+
+        return all_features
+
 
 def evaluate_features(features, labels, docs_per_query, weights, top_k=8):
     """
@@ -555,7 +815,7 @@ def main():
                         help='BEIR corpus dir (e.g., /path/to/beir) or retriever_output dir (for --compute_idf)')
     parser.add_argument('--max_docs_idf', type=int, default=5000,
                         help='Max documents per dataset for IDF computation')
-    args = parser.parse_args()
+    args = parse_args_with_config(parser)
 
     # Initialize tokenizer
     llm_name = LLM_NAMES[args.llm]

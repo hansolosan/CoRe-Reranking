@@ -46,6 +46,7 @@ EXTRA_ARGS=""
 # Arrays for multi-value arguments
 MAX_DOCS_LIST=()
 INPUT_FILES=()
+filter_mode=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -74,6 +75,9 @@ Optional arguments:
   --dry_run             Print commands without executing
   --extra_args "ARGS"   Additional arguments to pass to extract_head_features.py
   -h, --help            Show this help message
+  --fiter_mode stopwords|idf|high_freq
+                        Filters the words before adding the attention values by the specified type
+  --idf_file "idf_file" Specifies the file with the token idf values.
 
 Output naming:
   Files are saved as: {output_dir}/attention_features_{input_name}_k{max_docs}.npz
@@ -163,6 +167,14 @@ while [[ $# -gt 0 ]]; do
                 done
                 shift
             done
+            ;;
+        --idf_file)
+            idf_file="$2"
+            shift 2
+            ;;
+        --filter_mode)
+            filter_mode="$2"
+            shift 2
             ;;
         -h|--help)
             print_usage
@@ -288,6 +300,11 @@ COMPLETED=0
 FAILED=0
 SKIPPED=0
 
+script="${SCRIPT_DIR}/extract_head_features.py"
+if [[ "$filter_mode" == "idf" || "$filter_mode" == "stopwords" || "$filter_mode" == "high_freq" ]]; then
+  script="${SCRIPT_DIR}/extract_features_idf.py"
+fi
+
 # Run extraction for all combinations
 for INPUT_FILE in "${INPUT_FILES[@]}"; do
     # Get base name without extension
@@ -313,7 +330,7 @@ for INPUT_FILE in "${INPUT_FILES[@]}"; do
         fi
 
         # Build command
-        CMD="python ${SCRIPT_DIR}/extract_head_features.py"
+        CMD="python $script"
         CMD="$CMD --llm $LLM"
         CMD="$CMD --input_file \"$INPUT_FILE\""
         CMD="$CMD --qrels \"$QRELS\""
