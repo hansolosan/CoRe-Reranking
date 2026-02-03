@@ -285,7 +285,8 @@ def kfold_by_base_query(X, y, docs_per_query, n_folds=5, random_state=42,
 
 
 def train_single_lambda_cv(lambda_l1, X, y, docs_per_query, n_folds, num_layers, num_heads,
-                           max_iter, query_to_base, positions_per_query, loss='bce', temperature=1.0):
+                           max_iter, query_to_base, positions_per_query, loss='bce', temperature=1.0,
+                           verbose=False):
     """
     Train a single lambda value with k-fold cross-validation.
 
@@ -308,7 +309,7 @@ def train_single_lambda_cv(lambda_l1, X, y, docs_per_query, n_folds, num_layers,
             X_train_scaled, y_train, X_val_scaled, y_val,
             lambda_l1=lambda_l1, max_iter=max_iter, loss=loss,
             docs_per_query_train=docs_per_query_train,
-            temperature=temperature
+            temperature=temperature, verbose=verbose
         )
         fold_metrics.append(metrics)
 
@@ -327,7 +328,7 @@ def train_single_lambda_cv(lambda_l1, X, y, docs_per_query, n_folds, num_layers,
     final_trainer, _ = train_model(
         X_scaled, y, X_scaled, y, lambda_l1=lambda_l1, max_iter=max_iter, loss=loss,
         docs_per_query_train=docs_per_query,
-        temperature=temperature
+        temperature=temperature, verbose=verbose
     )
     weights = final_trainer.get_weights()
     top_heads, all_heads = analyze_weights(weights, num_layers, num_heads, top_k=20)
@@ -522,7 +523,8 @@ def save_results(output_dir, lambda_l1, num_samples, metrics, top_heads, all_hea
 
 
 def train_single_lambda(lambda_l1, X_train, y_train, X_val, y_val, num_layers, num_heads,
-                        max_iter=1000, loss='bce', docs_per_query_train=None, temperature=1.0):
+                        max_iter=1000, loss='bce', docs_per_query_train=None, temperature=1.0,
+                        verbose=False):
     """
     Train a single model for one lambda value. Designed for parallel execution.
 
@@ -533,7 +535,7 @@ def train_single_lambda(lambda_l1, X_train, y_train, X_val, y_val, num_layers, n
         X_train, y_train, X_val, y_val,
         lambda_l1=lambda_l1, max_iter=max_iter, loss=loss,
         docs_per_query_train=docs_per_query_train,
-        temperature=temperature
+        temperature=temperature, verbose=verbose
     )
     weights = trainer.get_weights()
     top_heads, all_heads = analyze_weights(weights, num_layers, num_heads, top_k=20)
@@ -578,6 +580,8 @@ def main():
                         help='Number of parallel jobs (-1 for all CPUs, default: 1)')
     parser.add_argument('--max_iter', type=int, default=1000,
                         help='Maximum iterations for SAGA solver (default: 1000)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Print training progress for each trainer')
     parser.add_argument('--input_file', type=str, default=None,
                         help='Original JSON file to determine query groupings. '
                              'If not provided, assumes 5 position variations per query.')
@@ -680,7 +684,7 @@ def main():
                 delayed(train_single_lambda_cv)(
                     lambda_l1, X, y, docs_per_query, args.cv,
                     num_layers, num_heads, args.max_iter,
-                    query_to_base, 5, args.loss, args.temp
+                    query_to_base, 5, args.loss, args.temp, args.verbose
                 )
                 for lambda_l1 in args.lambda_l1
             )
@@ -692,7 +696,7 @@ def main():
                 result = train_single_lambda_cv(
                     lambda_l1, X, y, docs_per_query, args.cv,
                     num_layers, num_heads, args.max_iter,
-                    query_to_base, 5, args.loss, args.temp
+                    query_to_base, 5, args.loss, args.temp, args.verbose
                 )
                 all_results.append(result)
 
@@ -779,7 +783,8 @@ def main():
             all_results = Parallel(n_jobs=n_jobs, verbose=10)(
                 delayed(train_single_lambda)(
                     lambda_l1, X_train_scaled, y_train, X_val_scaled, y_val,
-                    num_layers, num_heads, args.max_iter, args.loss, docs_per_query_train, args.temp
+                    num_layers, num_heads, args.max_iter, args.loss, docs_per_query_train, args.temp,
+                    args.verbose
                 )
                 for lambda_l1 in args.lambda_l1
             )
@@ -802,7 +807,8 @@ def main():
             for lambda_l1 in args.lambda_l1:
                 result = train_single_lambda(
                     lambda_l1, X_train_scaled, y_train, X_val_scaled, y_val,
-                    num_layers, num_heads, args.max_iter, args.loss, docs_per_query_train, args.temp
+                    num_layers, num_heads, args.max_iter, args.loss, docs_per_query_train, args.temp,
+                    args.verbose
                 )
                 all_results.append(result)
 
