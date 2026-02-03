@@ -5,9 +5,16 @@ Utility functions shared across scripts.
 
 import sys
 import getpass
+import argparse
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
 
 
 # Model configurations: (num_layers, num_heads_per_layer)
@@ -120,3 +127,89 @@ def log_command(logfile='logfile'):
             f.write(log_entry)
     except Exception as e:
         print(f"Warning: Could not write to logfile: {e}", file=sys.stderr)
+
+
+def parse_args_with_config(parser, args=None):
+    """
+    Parse arguments with optional YAML config file support.
+
+    If --config is provided, loads options from the YAML file as defaults.
+    Command-line arguments override YAML values.
+
+    Args:
+        parser: An argparse.ArgumentParser instance (should already have arguments added)
+        args: Arguments to parse (default: sys.argv[1:])
+
+    Returns:
+        Parsed namespace object
+
+    Usage:
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--learning_rate', type=float, default=0.001)
+        parser.add_argument('--batch_size', type=int, default=32)
+        # --config is added automatically
+        args = parse_args_with_config(parser)
+
+    YAML config file format:
+        learning_rate: 0.01
+        batch_size: 64
+    """
+    if not YAML_AVAILABLE:
+        print("Warning: PyYAML not installed. Config file support disabled.", file=sys.stderr)
+        return parser.parse_args(args)
+
+    # Add --config argument if not already present
+    config_action = None
+    for action in parser._actions:
+        if '--config' in action.option_strings:
+            config_action = action
+            break
+
+    if config_action is None:
+        parser.add_argument('--config', type=str, default=None,
+                            help='Path to YAML config file. CLI args override config values.')
+
+    if args is None:
+        args = sys.argv[1:]
+
+    # First pass: extract just the config file path
+    # Use parse_known_args to avoid errors from other required arguments
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument('--config', type=str, default=None)
+    config_args, _ = config_parser.parse_known_args(args)
+
+    # If config file specified, load it and set as defaults
+    if config_args.config is not None:
+        config_path = Path(config_args.config)
+        if not config_path.exists():
+            print(f"Error: Config file not found: {config_path}", file=sys.stderr)
+            sys.exit(1)
+
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+
+        if config is None:
+            config = {}
+
+        # Get valid argument names from parser
+        valid_args = set()
+        for action in parser._actions:
+            valid_args.update(action.option_strings)
+            if action.dest != 'help':
+                valid_args.add(action.dest)
+
+        # Filter config to only include valid arguments
+        filtered_config = {}
+        for key, value in config.items():
+            # Convert underscores to match argparse dest names
+            dest_key = key.replace('-', '_')
+            if dest_key in valid_args or f'--{key}' in valid_args or f'--{dest_key}' in valid_args:
+                filtered_config[dest_key] = value
+            else:
+                print(f"Warning: Unknown config key '{key}' ignored", file=sys.stderr)
+
+        # Set defaults from config file
+        parser.set_defaults(**filtered_config)
+
+    # Second pass: parse all arguments (CLI overrides config defaults)
+    return parser.parse_args(args)
