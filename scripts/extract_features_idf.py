@@ -815,6 +815,9 @@ def main():
                         help='BEIR corpus dir (e.g., /path/to/beir) or retriever_output dir (for --compute_idf)')
     parser.add_argument('--max_docs_idf', type=int, default=5000,
                         help='Max documents per dataset for IDF computation')
+    parser.add_argument('--batch_size', type=int, default=1,
+                        help='Batch size for feature extraction (default: 1)')
+
     args = parse_args_with_config(parser)
 
     # Initialize tokenizer
@@ -904,37 +907,79 @@ def main():
         token_idf=token_idf
     )
 
+    def extract_with_batching(extractor, data, batch_size, max_doc_tokens, desc="Processing"):
+        """Extract features using batching."""
+        all_features = []
+        all_labels = []
+        docs_per_query = []
+
+        # Prepare all queries and documents
+        queries = []
+        documents_list = []
+        labels_list = []
+
+        for sample in data:
+            query = sample.get('question', sample.get('query', ''))
+            documents = sample.get('paragraphs', [])
+            if not documents:
+                continue
+            queries.append(query)
+            documents_list.append(documents)
+            labels_list.append(np.array([1 if d.get('is_positive', False) else 0 for d in documents], dtype=np.int32))
+
+        # Process in batches
+        num_samples = len(queries)
+        for i in tqdm(range(0, num_samples, batch_size), desc=desc):
+            batch_queries = queries[i:i+batch_size]
+            batch_docs = documents_list[i:i+batch_size]
+            batch_labels = labels_list[i:i+batch_size]
+
+            try:
+                if batch_size > 1 and len(batch_queries) > 1:
+                    batch_features = extractor.extract_features_batch(
+                        batch_queries, batch_docs, max_doc_tokens=max_doc_tokens
+                    )
+                else:
+                    batch_features = [extractor.extract_features(
+                        batch_queries[0], batch_docs[0], max_doc_tokens=max_doc_tokens
+                    )]
+
+                for features, labels in zip(batch_features, batch_labels):
+                    all_features.append(features)
+                    all_labels.append(labels)
+                    docs_per_query.append(len(labels))
+
+            except Exception as e:
+                print(f"Error processing batch {i}: {e}")
+                # Fall back to single sample processing
+                for q, d, l in zip(batch_queries, batch_docs, batch_labels):
+                    try:
+                        features = extractor.extract_features(q, d, max_doc_tokens=max_doc_tokens)
+                        all_features.append(features)
+                        all_labels.append(l)
+                        docs_per_query.append(len(l))
+                    except Exception as e2:
+                        print(f"  Error processing single sample: {e2}")
+                        continue
+
+            torch.cuda.empty_cache()
+
+        if not all_features:
+            return None, None, None
+
+        return np.vstack(all_features), np.concatenate(all_labels), np.array(docs_per_query)
+
     # Extract baseline features first if comparing
     baseline_features = None
     if args.compare:
         print(f"\nExtracting baseline features (no filtering)...")
-        baseline_features = []
-        all_labels = []
-        docs_per_query = []
+        baseline_features, all_labels, docs_per_query = extract_with_batching(
+            extractor, data, args.batch_size, args.max_doc_tokens, desc="Baseline"
+        )
 
-        for sample in tqdm(data, desc="Processing samples (baseline)"):
-            query = sample.get('question', sample.get('query', ''))
-            documents = sample.get('paragraphs', [])
-
-            if not documents:
-                continue
-
-            try:
-                features = extractor.extract_features(query, documents, max_doc_tokens=args.max_doc_tokens)
-                labels = np.array([1 if d.get('is_positive', False) else 0 for d in documents], dtype=np.int32)
-
-                baseline_features.append(features)
-                all_labels.append(labels)
-                docs_per_query.append(len(documents))
-            except Exception as e:
-                print(f"Error processing sample: {e}")
-                continue
-
-            torch.cuda.empty_cache()
-
-        baseline_features = np.vstack(baseline_features)
-        all_labels = np.concatenate(all_labels)
-        docs_per_query = np.array(docs_per_query)
+        if baseline_features is None:
+            print("No baseline features extracted!")
+            return
 
         print(f"Baseline features: {baseline_features.shape}")
 
@@ -946,40 +991,20 @@ def main():
 
     # Extract features (filtered if compare, or whatever mode was requested)
     print(f"\nExtracting features with filter_mode={extractor.filter_mode}...")
-    all_features = []
-    if not args.compare:
-        all_labels = []
-        docs_per_query = []
 
-    for sample in tqdm(data, desc="Processing samples"):
-        query = sample.get('question', sample.get('query', ''))
-        documents = sample.get('paragraphs', [])
+    if args.compare:
+        # Labels already extracted during baseline
+        all_features, _, _ = extract_with_batching(
+            extractor, data, args.batch_size, args.max_doc_tokens, desc="Filtered"
+        )
+    else:
+        all_features, all_labels, docs_per_query = extract_with_batching(
+            extractor, data, args.batch_size, args.max_doc_tokens, desc="Processing"
+        )
 
-        if not documents:
-            continue
-
-        try:
-            features = extractor.extract_features(query, documents, max_doc_tokens=args.max_doc_tokens)
-            all_features.append(features)
-
-            if not args.compare:
-                labels = np.array([1 if d.get('is_positive', False) else 0 for d in documents], dtype=np.int32)
-                all_labels.append(labels)
-                docs_per_query.append(len(documents))
-        except Exception as e:
-            print(f"Error processing sample: {e}")
-            continue
-
-        torch.cuda.empty_cache()
-
-    if not all_features:
+    if all_features is None:
         print("No features extracted!")
         return
-
-    all_features = np.vstack(all_features)
-    if not args.compare:
-        all_labels = np.concatenate(all_labels)
-        docs_per_query = np.array(docs_per_query)
 
     print(f"\nExtracted features: {all_features.shape}")
     print(f"Labels: {all_labels.shape}, positives: {all_labels.sum()}")
