@@ -47,6 +47,7 @@ EXTRA_ARGS=""
 MAX_DOCS_LIST=()
 INPUT_FILES=()
 filter_mode=""
+idf_file=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -353,6 +354,14 @@ for INPUT_FILE in "${INPUT_FILES[@]}"; do
 
         if [[ -n "$EXTRA_ARGS" ]]; then
             CMD="$CMD $EXTRA_ARGS"
+        fi
+
+        if [[ -n "$idf_file" ]]; then
+            CMD="$CMD --idf_file $idf_file"
+        fi
+
+        if [[ -n "$filter_mode" ]]; then
+            CMD="$CMD --filter_mode $filter_mode"
         fi
 
         echo "Command: $CMD"
