@@ -636,8 +636,9 @@ def main():
         input_path = Path(args.input_file)
         if input_path.exists():
             print(f"\nLoading query groups from {input_path}...")
+            # Use actual number of queries from feature file, not args.num_samples
             query_to_base, n_base_queries = load_query_groups_from_json(
-                input_path, num_samples=args.num_samples
+                input_path, num_samples=n_queries
             )
             print(f"Found {n_base_queries} unique base queries from {n_queries} query samples")
         else:
@@ -648,8 +649,9 @@ def main():
         default_input = Path(__file__).parent.parent / 'head_data' / 'nq_core.json'
         if default_input.exists():
             print(f"\nLoading query groups from {default_input}...")
+            # Use actual number of queries from feature file, not args.num_samples
             query_to_base, n_base_queries = load_query_groups_from_json(
-                default_input, num_samples=args.num_samples
+                default_input, num_samples=n_queries
             )
             print(f"Found {n_base_queries} unique base queries from {n_queries} query samples")
         else:

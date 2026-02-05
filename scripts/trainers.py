@@ -1127,6 +1127,176 @@ class RankNetTrainer(BaseTrainer):
         return 1 / (1 + np.exp(-scores))
 
 
+class CoReTrainer(BaseTrainer):
+    """
+    Contrastive Retrieval (CoRe) trainer for head importance scoring.
+
+    Unlike other trainers that learn weights through optimization, CoRe directly
+    computes head importance scores using contrastive scoring between positive
+    and negative documents.
+
+    For each head h and query q:
+        score_h = softmax([pos_attention, neg_attention_1, ..., neg_attention_k] / temperature)[0]
+
+    Final weight for head h = mean(score_h) across all queries.
+
+    Higher weights indicate heads that better distinguish positive from negative documents.
+
+    IMPORTANT: To match the original CoRe implementation (experiments/head_detection.py):
+    1. Features must be extracted WITHOUT calibration (--no_calibration flag)
+    2. Labels should distinguish hard negatives (is_negative=True) from other documents.
+       The original CoRe only uses hard negatives in the softmax denominator, not all
+       non-positive documents. If using standard binary labels (1=positive, 0=all others),
+       results will differ from original CoRe.
+    """
+
+    def __init__(self, lambda_l1=0.0, temperature=0.001, max_iter=1, random_state=42, verbose=False):
+        """
+        Initialize CoRe trainer.
+
+        Args:
+            lambda_l1: L1 regularization strength (not used in CoRe, kept for interface compatibility)
+            temperature: Temperature for softmax over document scores. Lower values (e.g., 0.001)
+                        make the distribution more peaked, emphasizing the top-scoring head.
+                        Default: 0.001 (matches CoRe paper)
+            max_iter: Not used (CoRe computes scores in a single pass)
+            random_state: Random seed for reproducibility
+            verbose: Whether to print progress
+        """
+        super().__init__(lambda_l1, temperature, max_iter, random_state, verbose)
+
+    @property
+    def name(self) -> str:
+        return "core"
+
+    def fit(self, X_train, y_train, docs_per_query_train=None):
+        """
+        Compute head importance scores using CoRe contrastive method.
+
+        For each query, computes softmax over [pos_score, neg_scores] for each head,
+        then averages the positive probability across queries.
+
+        Args:
+            X_train: Training features (n_docs, n_features) - attention scores per head
+            y_train: Training labels (n_docs,):
+                     - 1 = positive document
+                     - 0 = hard negative document (used in CoRe scoring)
+                     - -1 = other document (ignored in CoRe scoring)
+            docs_per_query_train: Array of docs per query (required for CoRe)
+
+        Returns:
+            self
+        """
+        if docs_per_query_train is None:
+            raise ValueError("CoRe trainer requires docs_per_query_train")
+
+        n_features = X_train.shape[1]
+
+        if self.verbose:
+            print(f"  [{self.name}] Computing contrastive head scores (temp={self.temperature})...", end=" ", flush=True)
+
+        # Accumulate head scores across queries
+        head_scores = np.zeros(n_features)
+        n_valid_queries = 0
+
+        doc_offset = 0
+        for n_docs in docs_per_query_train:
+            X_q = X_train[doc_offset:doc_offset + n_docs]  # (n_docs, n_features)
+            y_q = y_train[doc_offset:doc_offset + n_docs]
+
+            # Positive documents (label 1)
+            pos_indices = np.where(y_q == 1)[0]
+            # Hard negative documents (label 0) - matches original CoRe behavior
+            # Label -1 documents are ignored (neither positive nor hard negative)
+            neg_indices = np.where(y_q == 0)[0]
+
+            # Skip if no positive or negative documents
+            if len(pos_indices) == 0 or len(neg_indices) == 0:
+                doc_offset += n_docs
+                continue
+
+            # For each head, compute contrastive score
+            for head_idx in range(n_features):
+                # Get attention scores for this head
+                pos_scores = X_q[pos_indices, head_idx]  # (n_pos,)
+                neg_scores = X_q[neg_indices, head_idx]  # (n_neg,)
+
+                # Average positive scores (in case of multiple positives)
+                pos_score = pos_scores.mean()
+
+                # Stack [pos_score, neg_scores] and apply softmax with temperature
+                all_scores = np.concatenate([[pos_score], neg_scores])
+                all_scores_scaled = all_scores / self.temperature
+
+                # Softmax with numerical stability
+                all_scores_shifted = all_scores_scaled - all_scores_scaled.max()
+                exp_scores = np.exp(all_scores_shifted)
+                softmax_probs = exp_scores / exp_scores.sum()
+
+                # Score for this head = probability assigned to positive
+                head_scores[head_idx] += softmax_probs[0]
+
+            n_valid_queries += 1
+            doc_offset += n_docs
+
+        if n_valid_queries == 0:
+            raise ValueError("No valid queries found (need at least one positive (label=1) and one hard negative (label=0) per query)")
+
+        # Average across queries to get final weights
+        self.weights_ = head_scores / n_valid_queries
+        self.intercept_ = 0.0
+
+        if self.verbose:
+            n_nonzero = int(np.sum(self.weights_ > 1e-6))
+            print(f"done. {n_valid_queries} queries, non-zero weights: {n_nonzero}, max: {self.weights_.max():.4f}")
+
+        return self
+
+    def predict_proba(self, X):
+        """
+        Predict document scores using CoRe head weights.
+
+        Computes weighted sum of attention scores across heads.
+
+        Args:
+            X: Features (n_samples, n_features) - attention scores per head
+
+        Returns:
+            probabilities: (n_samples,) document scores (higher = more relevant)
+        """
+        if self.weights_ is None:
+            raise ValueError("Model not fitted yet. Call fit() first.")
+
+        # Weight each head's attention score by its importance
+        scores = X @ self.weights_
+
+        # Normalize to [0, 1] using sigmoid
+        return 1 / (1 + np.exp(-scores))
+
+    def evaluate(self, X_val, y_val):
+        """
+        Evaluate model on validation data.
+
+        CoRe doesn't learn a decision boundary, so classification metrics are less meaningful.
+        Returns ranking-focused metrics instead.
+        """
+        y_prob = self.predict_proba(X_val)
+
+        metrics = {
+            'accuracy': accuracy_score(y_val, (y_prob >= 0.5).astype(int)),
+            'precision': precision_score(y_val, (y_prob >= 0.5).astype(int), zero_division=0),
+            'recall': recall_score(y_val, (y_prob >= 0.5).astype(int), zero_division=0),
+            'f1': f1_score(y_val, (y_prob >= 0.5).astype(int), zero_division=0),
+            'auc_roc': roc_auc_score(y_val, y_prob) if len(np.unique(y_val)) > 1 else 0.0,
+            'num_nonzero_weights': int(np.sum(self.weights_ > 1e-6)),
+            'sparsity': 1.0 - np.sum(self.weights_ > 1e-6) / len(self.weights_),
+            'max_weight': float(self.weights_.max()),
+            'mean_weight': float(self.weights_.mean()),
+        }
+
+        return metrics
+
+
 class InfoNCETrainer(BaseTrainer):
     """
     InfoNCE (Contrastive) loss trainer for listwise ranking.
@@ -1255,6 +1425,7 @@ TRAINERS = {
     'approx_ndcg_fast': ApproxNDCGFastTrainer,
     'group_lasso': GroupLassoTrainer,
     'ranknet': RankNetTrainer,
+    'core': CoReTrainer,
 }
 
 
