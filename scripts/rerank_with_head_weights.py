@@ -22,10 +22,19 @@ import json
 import argparse
 import re
 import numpy as np
+import torch
 from pathlib import Path
 from collections import defaultdict
+from tqdm import tqdm
 
 from utils import log_command, load_features, get_head_info
+
+# Try to import sentence-transformers (optional)
+try:
+    from sentence_transformers import SentenceTransformer, CrossEncoder
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 
 def load_qrels_file(qrels_path):
@@ -382,6 +391,245 @@ def compute_fused_scores(features, weights, docs_per_query, top_k_heads=None, rr
             fused_scores[start:end] = q_fused
 
     return fused_scores
+
+
+def detect_model_type(model_name):
+    """
+    Detect whether a model is a bi-encoder or cross-encoder based on its name.
+
+    Common cross-encoder patterns:
+    - Contains 'cross-encoder' or 'cross_encoder'
+    - Contains 'rerank' or 'reranker'
+    - BAAI/bge-reranker models
+    - ms-marco-MiniLM cross-encoder variants
+
+    Returns:
+        'cross-encoder' or 'bi-encoder'
+    """
+    model_lower = model_name.lower()
+
+    cross_encoder_patterns = [
+        'cross-encoder', 'cross_encoder', 'crossencoder',
+        'rerank', 'reranker',
+        'bge-reranker',
+        'ms-marco-minilm-l-6-v2',  # cross-encoder variant
+        'ms-marco-minilm-l-12-v2',  # cross-encoder variant
+    ]
+
+    for pattern in cross_encoder_patterns:
+        if pattern in model_lower:
+            return 'cross-encoder'
+
+    return 'bi-encoder'
+
+
+def load_reranker_model(model_name, device=None):
+    """
+    Load a reranker model (bi-encoder or cross-encoder).
+
+    Args:
+        model_name: HuggingFace model name or path
+        device: Device to load model on (default: auto-detect)
+
+    Returns:
+        model: Loaded model
+        model_type: 'bi-encoder' or 'cross-encoder'
+    """
+    if not SENTENCE_TRANSFORMERS_AVAILABLE:
+        raise ImportError(
+            "sentence-transformers is not installed. "
+            "Install with: pip install sentence-transformers"
+        )
+
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    model_type = detect_model_type(model_name)
+
+    print(f"Loading {model_type} model: {model_name}")
+    print(f"Device: {device}")
+
+    if model_type == 'cross-encoder':
+        model = CrossEncoder(model_name, device=device)
+    else:
+        model = SentenceTransformer(model_name, device=device)
+
+    return model, model_type
+
+
+def compute_embedding_scores(model, model_type, queries, documents_list, batch_size=32):
+    """
+    Compute document scores using an embedding model.
+
+    Args:
+        model: Loaded model (SentenceTransformer or CrossEncoder)
+        model_type: 'bi-encoder' or 'cross-encoder'
+        queries: List of query texts (one per query group)
+        documents_list: List of lists of document texts (one list per query)
+        batch_size: Batch size for inference
+
+    Returns:
+        all_scores: List of score arrays, one per query
+    """
+    all_scores = []
+
+    if model_type == 'cross-encoder':
+        # Cross-encoder: encode (query, doc) pairs directly
+        for query, documents in tqdm(zip(queries, documents_list), total=len(queries),
+                                      desc="Cross-encoder scoring"):
+            if not documents:
+                all_scores.append(np.array([]))
+                continue
+
+            # Create query-document pairs
+            pairs = [(query, doc) for doc in documents]
+
+            # Get scores
+            scores = model.predict(pairs, batch_size=batch_size, show_progress_bar=False)
+            all_scores.append(np.array(scores))
+
+    else:
+        # Bi-encoder: encode queries and documents separately, compute similarity
+        print("Encoding queries...")
+        query_embeddings = model.encode(queries, batch_size=batch_size, show_progress_bar=True)
+
+        print("Encoding documents...")
+        for i, (query_emb, documents) in enumerate(tqdm(zip(query_embeddings, documents_list),
+                                                         total=len(queries),
+                                                         desc="Computing similarities")):
+            if not documents:
+                all_scores.append(np.array([]))
+                continue
+
+            # Encode documents for this query
+            doc_embeddings = model.encode(documents, batch_size=batch_size, show_progress_bar=False)
+
+            # Compute cosine similarity
+            query_emb_norm = query_emb / np.linalg.norm(query_emb)
+            doc_emb_norms = doc_embeddings / np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
+            scores = np.dot(doc_emb_norms, query_emb_norm)
+
+            all_scores.append(scores)
+
+    return all_scores
+
+
+def load_input_data(input_file):
+    """
+    Load input data from JSON file (supports .json and .json.bz2).
+
+    Supports formats:
+    - Retriever output: [{"idx": query_id, "question": query, "paragraphs": [{"idx": doc_id, "paragraph_text": text}, ...]}, ...]
+    - Head detection data: [{"question": query, "paragraphs": [{"paragraph_text": text, "is_positive": bool}, ...]}, ...]
+
+    Returns:
+        data: List of samples
+        format_type: 'retriever_output' or 'head_detection'
+    """
+    import bz2
+
+    input_file = str(input_file)
+
+    # Handle bz2 compressed files
+    if input_file.endswith('.bz2'):
+        with bz2.open(input_file, 'rt', encoding='utf-8') as f:
+            data = json.load(f)
+    else:
+        with open(input_file, 'r') as f:
+            data = json.load(f)
+
+    # Detect format
+    if len(data) > 0:
+        sample = data[0]
+        if 'idx' in sample:
+            return data, 'retriever_output'
+        elif 'paragraphs' in sample and len(sample['paragraphs']) > 0:
+            if 'is_positive' in sample['paragraphs'][0]:
+                return data, 'head_detection'
+
+    return data, 'unknown'
+
+
+def rerank_with_embedding_model(model, model_type, input_data, input_format, batch_size=32,
+                                 max_doc_tokens=300):
+    """
+    Rerank documents using an embedding model.
+
+    Args:
+        model: Loaded embedding model
+        model_type: 'bi-encoder' or 'cross-encoder'
+        input_data: List of samples from input file
+        input_format: 'retriever_output' or 'head_detection'
+        batch_size: Batch size for inference
+        max_doc_tokens: Maximum tokens per document (word-based truncation)
+
+    Returns:
+        results: dict of {query_id: {doc_id: score, ...}}
+        labels: dict of {query_id: {doc_id: label, ...}} (if available)
+    """
+    queries = []
+    documents_list = []
+    query_ids = []
+    doc_ids_list = []
+    labels_dict = {}
+
+    for sample in input_data:
+        query = sample.get('question', sample.get('query', ''))
+        query_id = str(sample.get('idx', len(queries)))
+        paragraphs = sample.get('paragraphs', [])
+
+        if not paragraphs:
+            continue
+
+        # Extract document texts and IDs
+        docs = []
+        doc_ids = []
+        sample_labels = {}
+
+        for i, p in enumerate(paragraphs):
+            text = p.get('paragraph_text', '')
+            # Word-based truncation
+            if max_doc_tokens:
+                text = ' '.join(text.split()[:max_doc_tokens])
+            docs.append(text)
+
+            doc_id = str(p.get('idx', f'doc_{i}'))
+            doc_ids.append(doc_id)
+
+            # Get label if available
+            if input_format == 'head_detection':
+                if p.get('is_positive', False):
+                    sample_labels[doc_id] = 1
+                elif p.get('is_negative', False):
+                    sample_labels[doc_id] = 0
+                else:
+                    sample_labels[doc_id] = -1
+
+        queries.append(query)
+        documents_list.append(docs)
+        query_ids.append(query_id)
+        doc_ids_list.append(doc_ids)
+        if sample_labels:
+            labels_dict[query_id] = sample_labels
+
+    # Compute scores
+    print(f"\nComputing scores for {len(queries)} queries...")
+    all_scores = compute_embedding_scores(model, model_type, queries, documents_list, batch_size)
+
+    # Build results dict
+    results = {}
+    for query_id, doc_ids, scores in zip(query_ids, doc_ids_list, all_scores):
+        if len(scores) == 0:
+            continue
+
+        # Sort by score descending
+        sorted_indices = np.argsort(-scores)
+        results[query_id] = {
+            doc_ids[i]: float(scores[i])
+            for i in sorted_indices
+        }
+
+    return results, labels_dict
 
 
 def evaluate_ranking_beir(features, labels, weights, query_ids, doc_ids, docs_per_query,
@@ -960,18 +1208,41 @@ def main():
     # Log command execution
     log_command()
 
-    parser = argparse.ArgumentParser(description='Evaluate head weights on ranking metrics')
+    parser = argparse.ArgumentParser(description='Evaluate head weights or embedding models on ranking metrics')
     parser.add_argument('--llm', type=str, default='mistral',
-                        choices=['mistral', 'llama', 'phi', 'granite'])
-    parser.add_argument('--weight_file', type=str, required=True,
-                        help='Path to head weights file (BCE JSON or CoRe JSON)')
+                        choices=['mistral', 'llama', 'phi', 'granite'],
+                        help='LLM name (used for head weights mode)')
+
+    # Mutually exclusive: weight_file OR reranker_model
+    reranker_group = parser.add_mutually_exclusive_group(required=True)
+    reranker_group.add_argument('--weight_file', type=str, default=None,
+                                help='Path to head weights file (BCE JSON or CoRe JSON)')
+    reranker_group.add_argument('--reranker_model', type=str, default=None,
+                                help='HuggingFace embedding model for reranking (bi-encoder or cross-encoder). '
+                                     'Examples: BAAI/bge-reranker-base, sentence-transformers/all-MiniLM-L6-v2, '
+                                     'cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+    # Input files
     parser.add_argument('--feature_file', '-f', type=str, nargs='+', default=None,
-                        help='Path to feature file(s) (.npz). Can specify multiple files. '
+                        help='Path to feature file(s) (.npz). Required for head weights mode. '
                              'Default: head_data/{llm}/attention_features_n{num_samples}.npz')
+    parser.add_argument('--input_file', type=str, default=None,
+                        help='Input JSON file with queries and documents. Required for embedding model mode. '
+                             'Supports retriever_output format or head_detection format.')
     parser.add_argument('--num_samples', type=int, default=1000,
                         help='Number of samples in feature file (used for default path)')
+
+    # Head weights options
     parser.add_argument('--top_k_heads', type=int, nargs='+', default=None,
                         help='Evaluate with only top-k heads (can specify multiple)')
+
+    # Embedding model options
+    parser.add_argument('--model_batch_size', type=int, default=32,
+                        help='Batch size for embedding model inference (default: 32)')
+    parser.add_argument('--max_doc_tokens', type=int, default=300,
+                        help='Maximum tokens per document for embedding model (default: 300)')
+
+    # Common options
     parser.add_argument('--docs_per_query', type=int, default=None,
                         help='Number of documents per query (auto-detected from npz if available)')
     parser.add_argument('--ks', type=int, nargs='+', default=[1, 5, 10],
@@ -1013,6 +1284,138 @@ def main():
     # Normalize metric names to lowercase
     args.metrics = [m.lower() for m in args.metrics]
 
+    # ==========================================================================
+    # EMBEDDING MODEL MODE
+    # ==========================================================================
+    if args.reranker_model is not None:
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            print("Error: sentence-transformers is not installed.")
+            print("Install with: pip install sentence-transformers")
+            return
+
+        if args.input_file is None:
+            print("Error: --input_file is required when using --reranker_model")
+            return
+
+        print(f"Reranking with embedding model: {args.reranker_model}")
+        print(f"Input file: {args.input_file}")
+        print(f"Evaluator: {args.evaluator}")
+        print("=" * 70)
+
+        # Load model
+        model, model_type = load_reranker_model(args.reranker_model)
+
+        # Load input data
+        print(f"\nLoading input data from {args.input_file}...")
+        input_data, input_format = load_input_data(args.input_file)
+        print(f"Loaded {len(input_data)} samples (format: {input_format})")
+
+        # Rerank
+        results, labels_dict = rerank_with_embedding_model(
+            model, model_type, input_data, input_format,
+            batch_size=args.model_batch_size,
+            max_doc_tokens=args.max_doc_tokens
+        )
+
+        print(f"\nReranked {len(results)} queries")
+
+        # Load external qrels if provided
+        external_qrels = None
+        if args.qrels:
+            print(f"\nLoading external qrels from {args.qrels}...")
+            external_qrels = load_qrels_file(args.qrels)
+            total_relevant = sum(len(docs) for docs in external_qrels.values())
+            print(f"Loaded qrels: {len(external_qrels)} queries, {total_relevant} total relevant docs")
+
+        # Build qrels from labels if no external qrels
+        if external_qrels is None and labels_dict:
+            print("\nBuilding qrels from input data labels...")
+            external_qrels = {}
+            for q_id, doc_labels in labels_dict.items():
+                external_qrels[q_id] = {d_id: 1 for d_id, label in doc_labels.items() if label > 0}
+            total_relevant = sum(len(docs) for docs in external_qrels.values())
+            print(f"Built qrels: {len(external_qrels)} queries, {total_relevant} relevant docs")
+
+        # Evaluate using BEIR
+        if external_qrels and BEIR_AVAILABLE and args.evaluator == 'beir':
+            print("\nEvaluating with BEIR...")
+            evaluator = EvaluateRetrieval()
+
+            # Filter qrels to queries we have
+            qrels_filtered = {q_id: external_qrels[q_id] for q_id in results.keys() if q_id in external_qrels}
+
+            ndcg, _map, recall, precision = evaluator.evaluate(qrels_filtered, results, args.ks)
+
+            # Print results
+            print(f"\n{'='*70}")
+            print(f"Ranking Metrics ({model_type}: {args.reranker_model})")
+            print("=" * 70)
+
+            header = f"{'Model':<50}"
+            for k in args.ks:
+                header += f" {'NDCG@'+str(k):<8}"
+            print(header)
+            print("-" * len(header))
+
+            model_label = args.reranker_model
+            if len(model_label) > 48:
+                model_label = model_label[:45] + "..."
+            line = f"{model_label:<50}"
+            for k in args.ks:
+                line += f" {ndcg.get(f'NDCG@{k}', 0.0):<8.4f}"
+            print(line)
+
+            # Save results if output specified
+            if args.output:
+                output_data = {
+                    'reranker_model': args.reranker_model,
+                    'model_type': model_type,
+                    'input_file': args.input_file,
+                    'qrels_file': args.qrels,
+                    'num_queries': len(results),
+                    'metrics': {
+                        'ndcg': {f'NDCG@{k}': ndcg.get(f'NDCG@{k}', 0.0) for k in args.ks},
+                        'precision': {f'P@{k}': precision.get(f'P@{k}', 0.0) for k in args.ks},
+                        'recall': {f'Recall@{k}': recall.get(f'Recall@{k}', 0.0) for k in args.ks},
+                        'map': _map
+                    }
+                }
+                with open(args.output, 'w') as f:
+                    json.dump(output_data, f, indent=2)
+                print(f"\nSaved metrics to {args.output}")
+
+            # Save ranked results if requested
+            if args.save_ranked:
+                output_dir = Path('reranked_results') / 'embedding_models'
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+                model_name_safe = args.reranker_model.replace('/', '_')
+                output_file = output_dir / f'{model_name_safe}_reranked.json'
+
+                with open(output_file, 'w') as f:
+                    json.dump(results, f, indent=2)
+                print(f"Saved ranked results to {output_file}")
+
+        else:
+            print("\nWarning: Cannot evaluate without qrels. Use --qrels to provide relevance labels.")
+            print("Ranked results computed but not evaluated.")
+
+            if args.save_ranked:
+                output_dir = Path('reranked_results') / 'embedding_models'
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+                model_name_safe = args.reranker_model.replace('/', '_')
+                output_file = output_dir / f'{model_name_safe}_reranked.json'
+
+                with open(output_file, 'w') as f:
+                    json.dump(results, f, indent=2)
+                print(f"Saved ranked results to {output_file}")
+
+        return
+
+    # ==========================================================================
+    # HEAD WEIGHTS MODE
+    # ==========================================================================
     # Get model config
     num_layers, num_heads = get_head_info(args.llm)
 

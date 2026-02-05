@@ -2,8 +2,12 @@
 """
 Evaluate BEIR aggregate score by running reranking on all BEIR datasets.
 
+Supports two modes:
+1. Head weights mode: Uses attention head weights from .npz feature files
+2. Embedding model mode: Uses bi-encoder or cross-encoder models on JSON input files
+
 This script:
-1. Finds all .npz feature files for given k value(s) (e.g., *_k10.npz, *_k20.npz)
+1. Finds all .npz feature files (head weights mode) or .json input files (embedding mode)
 2. Runs rerank_with_head_weights.py on each dataset in parallel (configurable workers)
 3. Averages cqadupstack-* datasets into a single score
 4. Computes the overall BEIR average across datasets (14 main + 1 cqadupstack)
@@ -32,7 +36,7 @@ Output files:
 - {output_dir}/beir_aggregate_all.json - Combined results for all k values
 
 Example usage:
-    # Single k value
+    # Head weights mode - single k value
     python evaluate_beir_aggregate.py \\
         --llm mistral \\
         --weight_file head_data/mistral/bce_weights_lambda0.0001_n5000.json \\
@@ -42,7 +46,7 @@ Example usage:
         --n_jobs 8 \\
         --output_dir results/beir
 
-    # Multiple k values
+    # Head weights mode - multiple k values
     python evaluate_beir_aggregate.py \\
         --llm mistral \\
         --weight_file head_data/mistral/bce_weights_lambda0.0001_n5000.json \\
@@ -51,6 +55,21 @@ Example usage:
         --top_k_heads 8 16 32 \\
         --n_jobs 8 \\
         --output_dir results/beir
+
+    # Embedding model mode - cross-encoder
+    python evaluate_beir_aggregate.py \\
+        --reranker_model cross-encoder/ms-marco-MiniLM-L-6-v2 \\
+        --input_dir retriever_output \\
+        --beir_dir /path/to/beir \\
+        --n_jobs 4 \\
+        --output_dir results/beir_embedding
+
+    # Embedding model mode - bi-encoder
+    python evaluate_beir_aggregate.py \\
+        --reranker_model sentence-transformers/all-MiniLM-L6-v2 \\
+        --input_dir retriever_output \\
+        --beir_dir /path/to/beir \\
+        --output_dir results/beir_embedding
 
 Example output:
     ======================================================================
@@ -82,11 +101,31 @@ import argparse
 import json
 import subprocess
 import sys
+import os
+import signal
+import tempfile
+import torch.multiprocessing as mp
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from utils import log_command
+
+# Global list to track child processes for cleanup
+_child_processes = []
+
+
+def _cleanup_children(signum=None, frame=None):
+    """Terminate all child processes on signal."""
+    for p in _child_processes:
+        if p.is_alive():
+            p.terminate()
+    for p in _child_processes:
+        p.join(timeout=5)
+        if p.is_alive():
+            p.kill()
+    if signum is not None:
+        sys.exit(1)
 
 # BEIR dataset names
 BEIR_MAIN_DATASETS = [
@@ -168,6 +207,34 @@ def find_feature_files(feature_dir: Path, k: int) -> Dict[str, Path]:
     return dataset_files
 
 
+def find_input_json_files(input_dir: Path) -> Dict[str, Path]:
+    """
+    Find all .json and .json.bz2 input files for embedding model reranking.
+
+    Returns:
+        dict mapping dataset name to input file path
+    """
+    # Find both .json and .json.bz2 files
+    json_files = list(input_dir.glob("*.json"))
+    bz2_files = list(input_dir.glob("*.json.bz2"))
+
+    # Map files to dataset names
+    dataset_files = {}
+
+    for f in json_files:
+        dataset = f.stem
+        dataset_files[dataset] = f
+
+    for f in bz2_files:
+        # Remove both .json and .bz2 suffixes
+        dataset = f.name[:-9]  # Remove '.json.bz2'
+        # Only add if not already found as uncompressed
+        if dataset not in dataset_files:
+            dataset_files[dataset] = f
+
+    return dataset_files
+
+
 def validate_datasets(dataset_files: Dict[str, Path]) -> Tuple[bool, List[str]]:
     """
     Validate that all BEIR datasets are present and no duplicates.
@@ -190,6 +257,253 @@ def validate_datasets(dataset_files: Dict[str, Path]) -> Tuple[bool, List[str]]:
         issues.append(f"Extra datasets (not in BEIR): {sorted(extra)}")
 
     return is_valid, issues
+
+
+def gpu_worker_embedding(
+    gpu_id: int,
+    datasets: List[Tuple[str, Path, Optional[Path]]],  # (dataset_name, input_file, qrels_file)
+    reranker_model: str,
+    ks: List[int],
+    model_batch_size: int,
+    max_doc_tokens: int,
+    output_file: str
+):
+    """
+    Worker function that processes multiple datasets on a specific GPU.
+
+    Args:
+        gpu_id: GPU device ID to use
+        datasets: List of (dataset_name, input_file, qrels_file) tuples
+        reranker_model: HuggingFace model name
+        ks: K values for metrics
+        model_batch_size: Batch size for inference
+        max_doc_tokens: Max tokens per document
+        output_file: Path to save results JSON
+    """
+    import os
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+
+    # Limit parallelism
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
+    import torch
+    import json
+    import bz2
+    import numpy as np
+    from tqdm import tqdm
+
+    # Import sentence-transformers
+    try:
+        from sentence_transformers import SentenceTransformer, CrossEncoder
+    except ImportError:
+        print(f"[GPU {gpu_id}] Error: sentence-transformers not installed")
+        return
+
+    print(f"[GPU {gpu_id}] Starting worker with {len(datasets)} datasets", flush=True)
+
+    # Detect model type
+    model_lower = reranker_model.lower()
+    is_cross_encoder = any(p in model_lower for p in [
+        'cross-encoder', 'cross_encoder', 'rerank', 'bge-reranker'
+    ])
+
+    # Load model
+    print(f"[GPU {gpu_id}] Loading model: {reranker_model}", flush=True)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    if is_cross_encoder:
+        model = CrossEncoder(reranker_model, device=device)
+        model_type = 'cross-encoder'
+    else:
+        model = SentenceTransformer(reranker_model, device=device)
+        model_type = 'bi-encoder'
+
+    print(f"[GPU {gpu_id}] Model loaded ({model_type})", flush=True)
+
+    # Process each dataset
+    results = {}
+
+    # Dataset-level progress bar (position 0)
+    dataset_pbar = tqdm(datasets, desc=f"GPU {gpu_id} datasets", position=gpu_id*2, leave=True)
+
+    for dataset_name, input_file, qrels_file in dataset_pbar:
+        try:
+            # Load input data
+            input_str = str(input_file)
+            if input_str.endswith('.bz2'):
+                with bz2.open(input_str, 'rt', encoding='utf-8') as f:
+                    data = json.load(f)
+            else:
+                with open(input_str, 'r') as f:
+                    data = json.load(f)
+
+            # Load qrels if available
+            qrels = None
+            if qrels_file and qrels_file.exists():
+                qrels = {}
+                with open(qrels_file, 'r') as f:
+                    first_line = f.readline().strip()
+                    f.seek(0)
+                    if first_line.startswith('query-id') or first_line.startswith('query_id'):
+                        import csv
+                        reader = csv.DictReader(f, delimiter='\t')
+                        for row in reader:
+                            q_id = str(row.get('query-id', row.get('query_id', '')))
+                            d_id = str(row.get('corpus-id', row.get('corpus_id', row.get('doc-id', ''))))
+                            score = int(row.get('score', row.get('relevance', 0)))
+                            if q_id and d_id and score > 0:
+                                if q_id not in qrels:
+                                    qrels[q_id] = {}
+                                qrels[q_id][d_id] = score
+                    else:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 3:
+                                if len(parts) == 3:
+                                    q_id, d_id, score = parts
+                                else:
+                                    q_id, _, d_id, score = parts[:4]
+                                score = int(float(score))
+                                if score > 0:
+                                    if q_id not in qrels:
+                                        qrels[q_id] = {}
+                                    qrels[q_id][d_id] = score
+
+            # Process queries
+            reranked_results = {}
+
+            # Query-level progress bar (position 1, shows dataset name)
+            query_pbar = tqdm(data, desc=f"GPU {gpu_id} {dataset_name}", position=gpu_id*2+1, leave=False)
+
+            for sample in query_pbar:
+                query = sample.get('question', sample.get('query', ''))
+                query_id = str(sample.get('idx', ''))
+                paragraphs = sample.get('paragraphs', [])
+
+                if not paragraphs or not query:
+                    continue
+
+                # Extract documents
+                docs = []
+                doc_ids = []
+                for i, p in enumerate(paragraphs):
+                    text = p.get('paragraph_text', '')
+                    if max_doc_tokens:
+                        text = ' '.join(text.split()[:max_doc_tokens])
+                    docs.append(text)
+                    doc_ids.append(str(p.get('idx', f'doc_{i}')))
+
+                # Compute scores
+                if is_cross_encoder:
+                    pairs = [(query, doc) for doc in docs]
+                    scores = model.predict(pairs, batch_size=model_batch_size, show_progress_bar=False)
+                else:
+                    query_emb = model.encode([query], show_progress_bar=False)[0]
+                    doc_embs = model.encode(docs, batch_size=model_batch_size, show_progress_bar=False)
+                    query_emb_norm = query_emb / np.linalg.norm(query_emb)
+                    doc_emb_norms = doc_embs / np.linalg.norm(doc_embs, axis=1, keepdims=True)
+                    scores = np.dot(doc_emb_norms, query_emb_norm)
+
+                # Sort by score
+                sorted_indices = np.argsort(-np.array(scores))
+                reranked_results[query_id] = {
+                    doc_ids[i]: float(scores[i]) for i in sorted_indices
+                }
+
+            query_pbar.close()
+
+            # Compute metrics if qrels available
+            dataset_metrics = {}
+            if qrels:
+                try:
+                    from beir.retrieval.evaluation import EvaluateRetrieval
+                    evaluator = EvaluateRetrieval()
+                    qrels_filtered = {q: qrels[q] for q in reranked_results if q in qrels}
+                    if qrels_filtered:
+                        ndcg, _map, recall, precision = evaluator.evaluate(qrels_filtered, reranked_results, ks)
+                        dataset_metrics = {
+                            **{f'NDCG@{k}': ndcg.get(f'NDCG@{k}', 0.0) for k in ks},
+                            **{f'P@{k}': precision.get(f'P@{k}', 0.0) for k in ks},
+                            **{f'Recall@{k}': recall.get(f'Recall@{k}', 0.0) for k in ks},
+                        }
+                        if _map:
+                            dataset_metrics.update({k: v for k, v in _map.items()})
+                except ImportError:
+                    pass
+
+            results[dataset_name] = {
+                'metrics': dataset_metrics,
+                'num_queries': len(reranked_results)
+            }
+
+        except Exception as e:
+            print(f"[GPU {gpu_id}] Error processing {dataset_name}: {e}", flush=True)
+            results[dataset_name] = {'error': str(e)}
+
+    # Close dataset progress bar
+    dataset_pbar.close()
+
+    # Save results
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\n[GPU {gpu_id}] Done. Saved results to {output_file}", flush=True)
+
+    # Clean up
+    del model
+    import torch
+    torch.cuda.empty_cache()
+
+
+def run_reranking_embedding(
+    dataset: str,
+    input_file: Path,
+    reranker_model: str,
+    ks: List[int],
+    evaluator: str,
+    metrics: List[str],
+    output_dir: Path,
+    model_batch_size: int = 32,
+    max_doc_tokens: int = 300,
+    qrels_file: Path = None
+) -> Tuple[str, bool, str]:
+    """
+    Run rerank_with_head_weights.py with embedding model for a single dataset.
+
+    Returns:
+        (dataset_name, success, output_json_path or error_message)
+    """
+    output_file = output_dir / f"{dataset}_metrics.json"
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).parent / "rerank_with_head_weights.py"),
+        "--reranker_model", reranker_model,
+        "--input_file", str(input_file),
+        "--model_batch_size", str(model_batch_size),
+        "--max_doc_tokens", str(max_doc_tokens),
+        "--ks"] + [str(k) for k in ks] + [
+        "--metrics"] + metrics + [
+        "--evaluator", evaluator,
+        "--output", str(output_file)
+    ]
+
+    if qrels_file is not None:
+        cmd.extend(["--qrels", str(qrels_file)])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return (dataset, True, str(output_file))
+    except subprocess.CalledProcessError as e:
+        error_msg = f"Failed with exit code {e.returncode}\nStderr: {e.stderr}"
+        return (dataset, False, error_msg)
 
 
 def run_reranking(
@@ -264,7 +578,7 @@ def parse_results(output_file: Path) -> Dict[str, Dict[str, float]]:
     with open(output_file) as f:
         data = json.load(f)
 
-    # Extract metrics from file_results
+    # Extract metrics from file_results (head weights mode)
     results = {}
     for file_result in data.get('file_results', []):
         for result in file_result.get('results', []):
@@ -275,6 +589,41 @@ def parse_results(output_file: Path) -> Dict[str, Dict[str, float]]:
             # Create key as config_weights (e.g., "top-8_bce")
             key = f"{config}_{weights}"
             results[key] = metrics
+
+    return results
+
+
+def parse_results_embedding(output_file: Path) -> Dict[str, Dict[str, float]]:
+    """
+    Parse embedding model reranking output JSON and extract metrics.
+
+    Returns:
+        dict mapping config to metrics dict
+    """
+    with open(output_file) as f:
+        data = json.load(f)
+
+    results = {}
+
+    # Embedding model output format
+    if 'metrics' in data:
+        metrics_data = data['metrics']
+        # Flatten metrics from nested structure
+        flat_metrics = {}
+        for metric_type, values in metrics_data.items():
+            if isinstance(values, dict):
+                for k, v in values.items():
+                    flat_metrics[k] = v
+            else:
+                flat_metrics[metric_type] = values
+
+        # Use model name as config key
+        model_name = data.get('reranker_model', 'embedding')
+        # Shorten model name for display
+        if '/' in model_name:
+            model_name = model_name.split('/')[-1]
+
+        results[f"rerank_{model_name}"] = flat_metrics
 
     return results
 
@@ -600,17 +949,37 @@ Example (multiple k values):
         """
     )
 
-    parser.add_argument('--llm', type=str, required=True,
+    parser.add_argument('--llm', type=str, default='mistral',
                         choices=['mistral', 'llama', 'phi', 'granite'],
-                        help='LLM model name')
-    parser.add_argument('--weight_file', type=str, required=True,
-                        help='Path to head weights file (BCE or CoRe JSON)')
-    parser.add_argument('--feature_dir', type=str, required=True,
-                        help='Directory containing feature .npz files (e.g., head_data/mistral)')
-    parser.add_argument('--k', type=int, nargs='+', required=True,
-                        help='K value(s) for feature files - matches *_k{K}.npz pattern (e.g., 10 20 40 for multiple k values)')
-    parser.add_argument('--top_k_heads', type=int, nargs='+', required=True,
-                        help='List of top-k head values to evaluate - each produces separate aggregate (e.g., 1 2 4 8 16 32)')
+                        help='LLM model name (required for head weights mode)')
+
+    # Mutually exclusive: weight_file OR reranker_model
+    reranker_group = parser.add_mutually_exclusive_group(required=True)
+    reranker_group.add_argument('--weight_file', type=str, default=None,
+                                help='Path to head weights file (BCE or CoRe JSON)')
+    reranker_group.add_argument('--reranker_model', type=str, default=None,
+                                help='HuggingFace embedding model for reranking (bi-encoder or cross-encoder). '
+                                     'Examples: BAAI/bge-reranker-base, sentence-transformers/all-MiniLM-L6-v2')
+
+    # Head weights mode arguments
+    parser.add_argument('--feature_dir', type=str, default=None,
+                        help='Directory containing feature .npz files (required for head weights mode)')
+    parser.add_argument('--k', type=int, nargs='+', default=None,
+                        help='K value(s) for feature files - matches *_k{K}.npz pattern (required for head weights mode)')
+    parser.add_argument('--top_k_heads', type=int, nargs='+', default=None,
+                        help='List of top-k head values to evaluate (required for head weights mode)')
+
+    # Embedding model mode arguments
+    parser.add_argument('--input_dir', type=str, default=None,
+                        help='Directory containing input JSON files (required for embedding model mode)')
+    parser.add_argument('--model_batch_size', type=int, default=32,
+                        help='Batch size for embedding model inference (default: 32)')
+    parser.add_argument('--max_doc_tokens', type=int, default=300,
+                        help='Maximum tokens per document for embedding model (default: 300)')
+    parser.add_argument('--gpus', type=str, default=None,
+                        help='Comma-separated GPU IDs for embedding model mode (e.g., "0,1,2,3"). '
+                             'Each GPU runs one process with its own model instance. '
+                             'Datasets are distributed across GPUs.')
     parser.add_argument('--ks', type=int, nargs='+', default=[1, 5, 10],
                         help='K values for @k metrics - controls NDCG@K, P@K, etc. (default: 1 5 10)')
     parser.add_argument('--metrics', type=str, nargs='+',
@@ -647,18 +1016,52 @@ Example (multiple k values):
 
     args = parser.parse_args()
 
-    # Resolve paths
-    feature_dir = Path(args.feature_dir)
-    weight_file = Path(args.weight_file)
+    # Determine mode: head weights vs embedding model
+    embedding_mode = args.reranker_model is not None
+
+    # Validate mode-specific arguments
+    if embedding_mode:
+        # Embedding model mode
+        if args.input_dir is None:
+            print("Error: --input_dir is required when using --reranker_model")
+            sys.exit(1)
+
+        input_dir = Path(args.input_dir)
+        if not input_dir.exists():
+            print(f"Error: Input directory not found: {input_dir}")
+            sys.exit(1)
+
+        print(f"Mode: Embedding model reranking")
+        print(f"Model: {args.reranker_model}")
+        print(f"Input directory: {input_dir}")
+    else:
+        # Head weights mode
+        if args.feature_dir is None:
+            print("Error: --feature_dir is required when using --weight_file")
+            sys.exit(1)
+        if args.k is None:
+            print("Error: --k is required when using --weight_file")
+            sys.exit(1)
+        if args.top_k_heads is None:
+            print("Error: --top_k_heads is required when using --weight_file")
+            sys.exit(1)
+
+        feature_dir = Path(args.feature_dir)
+        weight_file = Path(args.weight_file)
+
+        if not feature_dir.exists():
+            print(f"Error: Feature directory not found: {feature_dir}")
+            sys.exit(1)
+
+        if not weight_file.exists():
+            print(f"Error: Weight file not found: {weight_file}")
+            sys.exit(1)
+
+        print(f"Mode: Head weights reranking")
+        print(f"Weight file: {weight_file}")
+        print(f"Feature directory: {feature_dir}")
+
     output_dir = Path(args.output_dir)
-
-    if not feature_dir.exists():
-        print(f"Error: Feature directory not found: {feature_dir}")
-        sys.exit(1)
-
-    if not weight_file.exists():
-        print(f"Error: Weight file not found: {weight_file}")
-        sys.exit(1)
 
     # Resolve beir_dir if provided
     beir_dir = Path(args.beir_dir) if args.beir_dir else None
@@ -680,6 +1083,297 @@ Example (multiple k values):
     all_k_dataset_results = {}  # k -> dataset_results (for corpus breakdown)
     all_failed = []
 
+    # ==========================================================================
+    # EMBEDDING MODEL MODE
+    # ==========================================================================
+    if embedding_mode:
+        # Find input JSON files
+        if args.verbose:
+            print(f"\nFinding input JSON files in {input_dir}...")
+        dataset_files = find_input_json_files(input_dir)
+        if args.verbose:
+            print(f"Found {len(dataset_files)} datasets")
+
+        # Validate datasets
+        is_valid, issues = validate_datasets(dataset_files)
+        if not is_valid and args.verbose:
+            print("\n⚠️  Dataset validation warnings:")
+            for issue in issues:
+                print(f"  - {issue}")
+            print()
+
+        # Check for required datasets
+        missing_main = set(BEIR_MAIN_DATASETS) - set(dataset_files.keys())
+        missing_cqa = [f'cqadupstack-{d}' for d in CQADUPSTACK_DOMAINS if f'cqadupstack-{d}' not in dataset_files]
+        found_cqa = [f'cqadupstack-{d}' for d in CQADUPSTACK_DOMAINS if f'cqadupstack-{d}' in dataset_files]
+
+        if missing_main:
+            print(f"Warning: Missing main BEIR datasets: {sorted(missing_main)}")
+            print("Continuing with available datasets...")
+
+        if missing_cqa and args.verbose:
+            print(f"⚠️  Warning: Missing {len(missing_cqa)}/12 cqadupstack datasets")
+            print(f"    Will aggregate using {len(found_cqa)} available cqadupstack datasets")
+
+        if args.dry_run:
+            print(f"\n[DRY RUN] Would evaluate the following datasets:")
+            for dataset in sorted(dataset_files.keys()):
+                print(f"  - {dataset}: {dataset_files[dataset].name}")
+            print(f"\nOutput directory: {output_dir}")
+            if args.gpus:
+                print(f"GPUs: {args.gpus}")
+            else:
+                print(f"Parallel jobs: {args.n_jobs}")
+            return
+
+        # Create output directory
+        emb_output_dir = output_dir / "embedding"
+        emb_output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Prepare dataset list with qrels
+        datasets_with_qrels = []
+        for dataset, input_file in dataset_files.items():
+            qrels_file = None
+            if beir_dir is not None:
+                qrels_file = get_qrels_path(beir_dir, dataset)
+                if not qrels_file.exists():
+                    if args.verbose:
+                        print(f"Warning: qrels file not found for {dataset}: {qrels_file}")
+                    qrels_file = None
+            datasets_with_qrels.append((dataset, input_file, qrels_file))
+
+        # Check if using multi-GPU mode
+        if args.gpus:
+            # Multi-GPU mode: one process per GPU
+            gpu_ids = [int(g.strip()) for g in args.gpus.split(',')]
+            num_gpus = len(gpu_ids)
+
+            print(f"\nMulti-GPU mode: distributing {len(datasets_with_qrels)} datasets across {num_gpus} GPUs")
+
+            # Distribute datasets across GPUs
+            datasets_per_gpu = [[] for _ in range(num_gpus)]
+            for i, dataset_info in enumerate(datasets_with_qrels):
+                datasets_per_gpu[i % num_gpus].append(dataset_info)
+
+            for i, gpu_id in enumerate(gpu_ids):
+                print(f"  GPU {gpu_id}: {len(datasets_per_gpu[i])} datasets")
+
+            # Create temp files for results
+            temp_dir = tempfile.mkdtemp(prefix='beir_embedding_')
+            temp_files = [os.path.join(temp_dir, f'gpu_{gpu_id}_results.json') for gpu_id in gpu_ids]
+
+            # Set multiprocessing start method
+            try:
+                mp.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass  # Already set
+
+            # Launch processes
+            processes = []
+            global _child_processes
+            _child_processes = []
+
+            # Set up signal handlers for cleanup
+            original_sigint = signal.signal(signal.SIGINT, _cleanup_children)
+            original_sigterm = signal.signal(signal.SIGTERM, _cleanup_children)
+
+            try:
+                for i, gpu_id in enumerate(gpu_ids):
+                    if not datasets_per_gpu[i]:
+                        continue
+
+                    p = mp.Process(
+                        target=gpu_worker_embedding,
+                        args=(
+                            gpu_id,
+                            datasets_per_gpu[i],
+                            args.reranker_model,
+                            args.ks,
+                            args.model_batch_size,
+                            args.max_doc_tokens,
+                            temp_files[i]
+                        )
+                    )
+                    processes.append((p, i, gpu_id))
+                    _child_processes.append(p)
+
+                print("\nStarting GPU workers...")
+                for p, i, gpu_id in processes:
+                    p.start()
+
+                # Wait for completion
+                for p, i, gpu_id in processes:
+                    p.join()
+
+            except KeyboardInterrupt:
+                print("\nInterrupted! Terminating workers...")
+                _cleanup_children()
+                sys.exit(1)
+            finally:
+                # Restore original signal handlers
+                signal.signal(signal.SIGINT, original_sigint)
+                signal.signal(signal.SIGTERM, original_sigterm)
+                _child_processes = []
+
+            print("\nAll workers completed. Merging results...")
+
+            # Merge results from all GPUs
+            dataset_results = {}
+            for i, (_, idx, gpu_id) in enumerate(processes):
+                temp_file = temp_files[idx]
+                if os.path.exists(temp_file):
+                    with open(temp_file, 'r') as f:
+                        gpu_results = json.load(f)
+
+                    for dataset_name, result in gpu_results.items():
+                        if 'error' in result:
+                            all_failed.append(dataset_name)
+                            if args.verbose:
+                                print(f"  ✗ {dataset_name}: {result['error']}")
+                        else:
+                            metrics = result.get('metrics', {})
+                            if metrics:
+                                # Format as expected by aggregation functions
+                                model_name = args.reranker_model.split('/')[-1]
+                                dataset_results[dataset_name] = {
+                                    f"rerank_{model_name}": metrics
+                                }
+                            if args.verbose:
+                                print(f"  ✓ {dataset_name}: {result.get('num_queries', 0)} queries")
+
+                    os.remove(temp_file)
+
+            # Clean up temp dir
+            try:
+                os.rmdir(temp_dir)
+            except OSError:
+                pass
+
+        else:
+            # Single-process mode using subprocess (original behavior)
+            if args.verbose:
+                print(f"\nRunning evaluations on {len(dataset_files)} datasets with {args.n_jobs} parallel jobs...")
+
+            results = {}
+            failed = []
+
+            with ProcessPoolExecutor(max_workers=args.n_jobs) as executor:
+                futures = {}
+                for dataset, input_file, qrels_file in datasets_with_qrels:
+                    future = executor.submit(
+                        run_reranking_embedding,
+                        dataset,
+                        input_file,
+                        args.reranker_model,
+                        args.ks,
+                        args.evaluator,
+                        args.metrics,
+                        emb_output_dir,
+                        args.model_batch_size,
+                        args.max_doc_tokens,
+                        qrels_file
+                    )
+                    futures[future] = dataset
+
+                for future in as_completed(futures):
+                    dataset = futures[future]
+                    try:
+                        dataset_name, success, result = future.result()
+                        if success:
+                            if args.verbose:
+                                print(f"✓ {dataset_name}")
+                            results[dataset_name] = result
+                        else:
+                            if args.verbose:
+                                print(f"✗ {dataset_name}: {result}")
+                            failed.append(dataset_name)
+                            all_failed.append(dataset_name)
+                    except Exception as e:
+                        if args.verbose:
+                            print(f"✗ {dataset}: {e}")
+                        failed.append(dataset)
+                        all_failed.append(dataset)
+
+            if failed and args.verbose:
+                print(f"\n⚠️  {len(failed)} datasets failed:")
+                for dataset in failed:
+                    print(f"  - {dataset}")
+
+            # Parse all results
+            if args.verbose:
+                print("\nParsing results...")
+            dataset_results = {}
+            for dataset, output_file_path in results.items():
+                try:
+                    dataset_results[dataset] = parse_results_embedding(Path(output_file_path))
+                except Exception as e:
+                    if args.verbose:
+                        print(f"Error parsing {dataset}: {e}")
+
+        # Compute BEIR average
+        if args.verbose:
+            print("\nComputing BEIR aggregate scores...")
+        beir_avg = compute_beir_average(dataset_results)
+        all_k_results['embedding'] = beir_avg
+        all_k_dataset_results['embedding'] = dataset_results
+
+        # Save aggregated results
+        output_file = emb_output_dir / "beir_aggregate.json"
+        cqadupstack_agg = aggregate_cqadupstack(dataset_results)
+
+        output_data = {
+            'reranker_model': args.reranker_model,
+            'ks': args.ks,
+            'metrics': args.metrics,
+            'evaluator': args.evaluator,
+            'beir_average': beir_avg,
+            'cqadupstack_average': cqadupstack_agg,
+            'per_dataset': {
+                dataset: metrics
+                for dataset, metrics in dataset_results.items()
+                if dataset in BEIR_MAIN_DATASETS
+            }
+        }
+
+        with open(output_file, 'w') as f:
+            json.dump(output_data, f, indent=2)
+
+        print(f"\n✓ Saved aggregate results to {output_file}")
+
+        # Print results
+        print("\n" + "="*70)
+        print(f"BEIR Aggregate Results (Embedding Model)")
+        print(f"Model: {args.reranker_model}")
+        print("="*70)
+
+        if beir_avg:
+            first_config = list(beir_avg.keys())[0]
+            metric_names = list(beir_avg[first_config].keys())
+
+            # Print header
+            header = f"{'Config':<30}"
+            for metric in metric_names:
+                header += f" {metric:<10}"
+            print(header)
+            print("-" * len(header))
+
+            # Print results
+            for config_key, metrics in beir_avg.items():
+                line = f"{config_key:<30}"
+                for metric in metric_names:
+                    value = metrics.get(metric, 0.0)
+                    line += f" {value:<10.4f}"
+                print(line)
+
+        print("="*70)
+
+        if all_failed:
+            sys.exit(1)
+        return
+
+    # ==========================================================================
+    # HEAD WEIGHTS MODE
+    # ==========================================================================
     # Process each k value
     k_values = sorted(args.k)
 
