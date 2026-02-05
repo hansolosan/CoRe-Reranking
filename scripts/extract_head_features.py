@@ -1306,7 +1306,18 @@ def main():
 
             # Get labels
             if input_format == 'head_detection':
-                labels = np.array([1 if d.get('is_positive', False) else 0 for d in documents], dtype=np.int32)
+                # For head detection format, distinguish positives, hard negatives, and others:
+                # 1 = is_positive=True (positive document)
+                # 0 = is_negative=True (hard negative document)
+                # -1 = neither (not used in CoRe scoring)
+                def get_head_detection_label(d):
+                    if d.get('is_positive', False):
+                        return 1
+                    elif d.get('is_negative', False):
+                        return 0
+                    else:
+                        return -1
+                labels = np.array([get_head_detection_label(d) for d in documents], dtype=np.int32)
             elif qrels is not None:
                 labels = np.array([
                     get_label_from_qrels(query_id, doc_id, qrels, args.relevance_threshold)
