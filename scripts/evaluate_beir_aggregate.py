@@ -109,7 +109,7 @@ from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
-from utils import log_command
+from utils import log_command, parse_args_with_config, load_cross_encoder
 
 # Global list to track child processes for cleanup
 _child_processes = []
@@ -296,6 +296,13 @@ def gpu_worker_embedding(
     import numpy as np
     from tqdm import tqdm
 
+    # Print GPU info
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)  # 0 because we set CUDA_VISIBLE_DEVICES
+        print(f"[GPU {gpu_id}] {gpu_name}", flush=True)
+    else:
+        print(f"[GPU {gpu_id}] WARNING: CUDA not available, using CPU", flush=True)
+
     # Import sentence-transformers
     try:
         from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -303,20 +310,20 @@ def gpu_worker_embedding(
         print(f"[GPU {gpu_id}] Error: sentence-transformers not installed")
         return
 
-    # Check which datasets already have results (skip if output_dir provided and file exists)
+    # Check which datasets already have results (skip if output_dir provided and .json.bz2 file exists)
     datasets_to_process = []
     skipped_results = {}
 
     for dataset_name, input_file, qrels_file in datasets:
         if output_dir:
-            result_file = os.path.join(output_dir, f"{dataset_name}_metrics.json")
-            if os.path.exists(result_file):
+            reranked_file = os.path.join(output_dir, f"{dataset_name}.json.bz2")
+            if os.path.exists(reranked_file):
                 try:
-                    with open(result_file, 'r') as f:
+                    with bz2.open(reranked_file, 'rt', encoding='utf-8') as f:
                         existing = json.load(f)
                     skipped_results[dataset_name] = {
                         'metrics': existing.get('metrics', {}),
-                        'num_queries': existing.get('num_queries', 0),
+                        'num_queries': existing.get('num_queries', len(existing.get('results', {}))),
                         'skipped': True
                     }
                     continue
@@ -347,7 +354,7 @@ def gpu_worker_embedding(
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     if is_cross_encoder:
-        model = CrossEncoder(reranker_model, device=device)
+        model = load_cross_encoder(reranker_model, device=device, verbose=True)
         model_type = 'cross-encoder'
     else:
         model = SentenceTransformer(reranker_model, device=device)
@@ -357,6 +364,13 @@ def gpu_worker_embedding(
 
     # Process each dataset - start with skipped results
     results = dict(skipped_results)
+
+    # Statistics tracking
+    import time
+    start_time = time.time()
+    total_queries = 0
+    total_docs = 0
+    total_tokens = 0  # Word count as proxy for tokens
 
     # Dataset-level progress bar (position 0)
     dataset_pbar = tqdm(datasets_to_process, desc=f"GPU {gpu_id} datasets", position=gpu_id*2, leave=True)
@@ -405,7 +419,8 @@ def gpu_worker_embedding(
                                     qrels[q_id][d_id] = score
 
             # Process queries
-            reranked_results = {}
+            reranked_results = {}  # For metrics: {query_id: {doc_id: score}}
+            reranked_data = []  # For output: same format as input
 
             # Query-level progress bar (position 1, shows dataset name)
             query_pbar = tqdm(data, desc=f"GPU {gpu_id} {dataset_name}", position=gpu_id*2+1, leave=False)
@@ -416,34 +431,77 @@ def gpu_worker_embedding(
                 paragraphs = sample.get('paragraphs', [])
 
                 if not paragraphs or not query:
+                    # Keep sample as-is if no paragraphs
+                    reranked_data.append(sample)
                     continue
 
-                # Extract documents
+                # Extract documents for scoring
                 docs = []
-                doc_ids = []
+                query_tokens = len(query.split())
                 for i, p in enumerate(paragraphs):
                     text = p.get('paragraph_text', '')
                     if max_doc_tokens:
                         text = ' '.join(text.split()[:max_doc_tokens])
                     docs.append(text)
-                    doc_ids.append(str(p.get('idx', f'doc_{i}')))
 
-                # Compute scores
-                if is_cross_encoder:
-                    pairs = [(query, doc) for doc in docs]
-                    scores = model.predict(pairs, batch_size=model_batch_size, show_progress_bar=False)
+                # Update statistics
+                total_queries += 1
+                total_docs += len(paragraphs)
+                total_tokens += query_tokens + sum(len(doc.split()) for doc in docs)
+
+                # Compute scores with OOM handling
+                scores = None
+                current_batch_size = model_batch_size
+
+                for attempt in range(2):  # Try twice: original batch size, then batch_size=1
+                    try:
+                        if is_cross_encoder:
+                            pairs = [(query, doc) for doc in docs]
+                            scores = model.predict(pairs, batch_size=current_batch_size, show_progress_bar=False)
+                        else:
+                            query_emb = model.encode([query], show_progress_bar=False)[0]
+                            doc_embs = model.encode(docs, batch_size=current_batch_size, show_progress_bar=False)
+                            query_emb_norm = query_emb / np.linalg.norm(query_emb)
+                            doc_emb_norms = doc_embs / np.linalg.norm(doc_embs, axis=1, keepdims=True)
+                            scores = np.dot(doc_emb_norms, query_emb_norm)
+                        break  # Success
+                    except RuntimeError as e:
+                        if 'out of memory' in str(e).lower() or 'CUDA' in str(e):
+                            torch.cuda.empty_cache()
+                            if attempt == 0:
+                                print(f"\n[GPU {gpu_id}] OOM at query {query_id} ({len(docs)} docs), retrying with batch_size=1", flush=True)
+                                current_batch_size = 1
+                            else:
+                                print(f"\n[GPU {gpu_id}] OOM at query {query_id} even with batch_size=1, keeping original order", flush=True)
+                                scores = None
+                        else:
+                            raise
+
+                # Reorder paragraphs by score
+                if scores is not None:
+                    sorted_indices = np.argsort(-np.array(scores))
+                    reranked_paragraphs = [paragraphs[i] for i in sorted_indices]
+                    # Add scores to paragraphs
+                    for rank, idx in enumerate(sorted_indices):
+                        reranked_paragraphs[rank] = dict(reranked_paragraphs[rank])
+                        reranked_paragraphs[rank]['rerank_score'] = float(scores[idx])
+                    # Build metrics dict
+                    reranked_results[query_id] = {
+                        str(paragraphs[i].get('idx', f'doc_{i}')): float(scores[i])
+                        for i in sorted_indices
+                    }
                 else:
-                    query_emb = model.encode([query], show_progress_bar=False)[0]
-                    doc_embs = model.encode(docs, batch_size=model_batch_size, show_progress_bar=False)
-                    query_emb_norm = query_emb / np.linalg.norm(query_emb)
-                    doc_emb_norms = doc_embs / np.linalg.norm(doc_embs, axis=1, keepdims=True)
-                    scores = np.dot(doc_emb_norms, query_emb_norm)
+                    # Keep original order
+                    reranked_paragraphs = paragraphs
+                    reranked_results[query_id] = {
+                        str(p.get('idx', f'doc_{i}')): float(len(paragraphs) - i)
+                        for i, p in enumerate(paragraphs)
+                    }
 
-                # Sort by score
-                sorted_indices = np.argsort(-np.array(scores))
-                reranked_results[query_id] = {
-                    doc_ids[i]: float(scores[i]) for i in sorted_indices
-                }
+                # Build reranked sample (same format as input)
+                reranked_sample = dict(sample)
+                reranked_sample['paragraphs'] = reranked_paragraphs
+                reranked_data.append(reranked_sample)
 
             query_pbar.close()
 
@@ -472,11 +530,23 @@ def gpu_worker_embedding(
             }
             results[dataset_name] = dataset_result
 
-            # Save individual dataset result to output_dir
+            # Save outputs to output_dir
             if output_dir:
-                result_file = os.path.join(output_dir, f"{dataset_name}_metrics.json")
-                with open(result_file, 'w') as f:
-                    json.dump(dataset_result, f, indent=2)
+                # Save reranked data as .json.bz2 (same format as input)
+                reranked_file = os.path.join(output_dir, f"{dataset_name}.json.bz2")
+                with bz2.open(reranked_file, 'wt', encoding='utf-8') as f:
+                    json.dump(reranked_data, f)
+
+                # Save metrics and info as separate .json file
+                metrics_file = os.path.join(output_dir, f"{dataset_name}_metrics.json")
+                metrics_output = {
+                    'dataset': dataset_name,
+                    'reranker_model': reranker_model,
+                    'num_queries': len(reranked_results),
+                    'metrics': dataset_metrics
+                }
+                with open(metrics_file, 'w') as f:
+                    json.dump(metrics_output, f, indent=2)
 
         except Exception as e:
             print(f"[GPU {gpu_id}] Error processing {dataset_name}: {e}", flush=True)
@@ -489,11 +559,22 @@ def gpu_worker_embedding(
     with open(output_file, 'w') as f:
         json.dump(results, f, indent=2)
 
-    print(f"\n[GPU {gpu_id}] Done. Saved results to {output_file}", flush=True)
+    # Print statistics
+    elapsed_time = time.time() - start_time
+    if elapsed_time > 0 and total_queries > 0:
+        queries_per_sec = total_queries / elapsed_time
+        docs_per_sec = total_docs / elapsed_time
+        tokens_per_sec = total_tokens / elapsed_time
+        print(f"\n[GPU {gpu_id}] Statistics:", flush=True)
+        print(f"  Time: {elapsed_time:.1f}s", flush=True)
+        print(f"  Queries: {total_queries} ({queries_per_sec:.1f}/s)", flush=True)
+        print(f"  Documents: {total_docs} ({docs_per_sec:.1f}/s)", flush=True)
+        print(f"  Tokens: {total_tokens} ({tokens_per_sec:.0f}/s)", flush=True)
+
+    print(f"[GPU {gpu_id}] Done. Saved results to {output_file}", flush=True)
 
     # Clean up
     del model
-    import torch
     torch.cuda.empty_cache()
 
 
@@ -993,8 +1074,8 @@ Example (multiple k values):
                         choices=['mistral', 'llama', 'phi', 'granite'],
                         help='LLM model name (required for head weights mode)')
 
-    # Mutually exclusive: weight_file OR reranker_model
-    reranker_group = parser.add_mutually_exclusive_group(required=True)
+    # Mutually exclusive: weight_file OR reranker_model (required=False for config file support)
+    reranker_group = parser.add_mutually_exclusive_group(required=False)
     reranker_group.add_argument('--weight_file', type=str, default=None,
                                 help='Path to head weights file (BCE or CoRe JSON)')
     reranker_group.add_argument('--reranker_model', type=str, default=None,
@@ -1032,7 +1113,7 @@ Example (multiple k values):
                         help='Path to BEIR data directory containing qrels files (e.g., /path/to/beir). '
                              'Qrels are loaded from {beir_dir}/{corpus}/qrels/test.tsv. '
                              'Required when using --evaluator beir for proper NDCG computation.')
-    parser.add_argument('--output_dir', type=str, required=True,
+    parser.add_argument('--output_dir', type=str, default=None,
                         help='Output directory for results - saves {dataset}_metrics.json and beir_aggregate.json')
     parser.add_argument('--no_baseline', action='store_true',
                         help='Skip baseline retriever evaluation (only evaluate reranked results)')
@@ -1054,7 +1135,15 @@ Example (multiple k values):
     parser.add_argument('--no_corpus_breakdown', action='store_true',
                         help='Skip per-corpus breakdown table (only show aggregate)')
 
-    args = parser.parse_args()
+    args = parse_args_with_config(parser)
+
+    # Validate required arguments
+    if args.weight_file is None and args.reranker_model is None:
+        parser.error("one of the arguments --weight_file --reranker_model is required")
+    if args.weight_file is not None and args.reranker_model is not None:
+        parser.error("argument --weight_file: not allowed with argument --reranker_model")
+    if args.output_dir is None:
+        parser.error("the following argument is required: --output_dir")
 
     # Determine mode: head weights vs embedding model
     embedding_mode = args.reranker_model is not None
@@ -1292,13 +1381,19 @@ Example (multiple k values):
 
         else:
             # Single-process mode using subprocess (original behavior)
-            # Check which datasets already have results
+            # Check which datasets already have results (.json.bz2 files)
+            import bz2 as bz2_module
             datasets_to_run = []
             skipped_results = {}
             for dataset, input_file, qrels_file in datasets_with_qrels:
-                output_file = emb_output_dir / f"{dataset}_metrics.json"
-                if output_file.exists():
-                    skipped_results[dataset] = str(output_file)
+                reranked_file = emb_output_dir / f"{dataset}.json.bz2"
+                if reranked_file.exists():
+                    try:
+                        with bz2_module.open(reranked_file, 'rt', encoding='utf-8') as f:
+                            existing = json.load(f)
+                        skipped_results[dataset] = str(reranked_file)
+                    except Exception:
+                        datasets_to_run.append((dataset, input_file, qrels_file))
                 else:
                     datasets_to_run.append((dataset, input_file, qrels_file))
 

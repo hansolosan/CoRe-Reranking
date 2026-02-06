@@ -27,7 +27,7 @@ from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
 
-from utils import log_command, load_features, get_head_info
+from utils import log_command, load_features, get_head_info, load_cross_encoder
 
 # Try to import sentence-transformers (optional)
 try:
@@ -450,7 +450,7 @@ def load_reranker_model(model_name, device=None):
     print(f"Device: {device}")
 
     if model_type == 'cross-encoder':
-        model = CrossEncoder(model_name, device=device)
+        model = load_cross_encoder(model_name, device=device, verbose=True)
     else:
         model = SentenceTransformer(model_name, device=device)
 
@@ -471,12 +471,32 @@ def compute_embedding_scores(model, model_type, queries, documents_list, batch_s
     Returns:
         all_scores: List of score arrays, one per query
     """
+    import torch
+
+    def compute_with_oom_handling(compute_fn, query_idx, num_docs, original_batch_size):
+        """Try computation with OOM handling - retry with batch_size=1 on failure."""
+        current_batch_size = original_batch_size
+        for attempt in range(2):
+            try:
+                return compute_fn(current_batch_size)
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower() or 'CUDA' in str(e):
+                    torch.cuda.empty_cache()
+                    if attempt == 0:
+                        print(f"\nOOM at query {query_idx} ({num_docs} docs), retrying with batch_size=1", flush=True)
+                        current_batch_size = 1
+                    else:
+                        print(f"\nOOM at query {query_idx} even with batch_size=1, keeping original order", flush=True)
+                        return None  # Signal to keep original order
+                else:
+                    raise
+
     all_scores = []
 
     if model_type == 'cross-encoder':
         # Cross-encoder: encode (query, doc) pairs directly
-        for query, documents in tqdm(zip(queries, documents_list), total=len(queries),
-                                      desc="Cross-encoder scoring"):
+        for idx, (query, documents) in enumerate(tqdm(zip(queries, documents_list), total=len(queries),
+                                                       desc="Cross-encoder scoring")):
             if not documents:
                 all_scores.append(np.array([]))
                 continue
@@ -484,8 +504,13 @@ def compute_embedding_scores(model, model_type, queries, documents_list, batch_s
             # Create query-document pairs
             pairs = [(query, doc) for doc in documents]
 
-            # Get scores
-            scores = model.predict(pairs, batch_size=batch_size, show_progress_bar=False)
+            def compute_cross(bs):
+                return model.predict(pairs, batch_size=bs, show_progress_bar=False)
+
+            scores = compute_with_oom_handling(compute_cross, idx, len(documents), batch_size)
+            if scores is None:
+                # Keep original order with decreasing scores
+                scores = np.array([len(documents) - i for i in range(len(documents))], dtype=np.float32)
             all_scores.append(np.array(scores))
 
     else:
@@ -494,21 +519,23 @@ def compute_embedding_scores(model, model_type, queries, documents_list, batch_s
         query_embeddings = model.encode(queries, batch_size=batch_size, show_progress_bar=True)
 
         print("Encoding documents...")
-        for i, (query_emb, documents) in enumerate(tqdm(zip(query_embeddings, documents_list),
-                                                         total=len(queries),
-                                                         desc="Computing similarities")):
+        for idx, (query_emb, documents) in enumerate(tqdm(zip(query_embeddings, documents_list),
+                                                          total=len(queries),
+                                                          desc="Computing similarities")):
             if not documents:
                 all_scores.append(np.array([]))
                 continue
 
-            # Encode documents for this query
-            doc_embeddings = model.encode(documents, batch_size=batch_size, show_progress_bar=False)
+            def compute_bi(bs):
+                doc_embeddings = model.encode(documents, batch_size=bs, show_progress_bar=False)
+                query_emb_norm = query_emb / np.linalg.norm(query_emb)
+                doc_emb_norms = doc_embeddings / np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
+                return np.dot(doc_emb_norms, query_emb_norm)
 
-            # Compute cosine similarity
-            query_emb_norm = query_emb / np.linalg.norm(query_emb)
-            doc_emb_norms = doc_embeddings / np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
-            scores = np.dot(doc_emb_norms, query_emb_norm)
-
+            scores = compute_with_oom_handling(compute_bi, idx, len(documents), batch_size)
+            if scores is None:
+                # Keep original order with decreasing scores
+                scores = np.array([len(documents) - i for i in range(len(documents))], dtype=np.float32)
             all_scores.append(scores)
 
     return all_scores
@@ -1300,6 +1327,14 @@ def main():
         print(f"Reranking with embedding model: {args.reranker_model}")
         print(f"Input file: {args.input_file}")
         print(f"Evaluator: {args.evaluator}")
+
+        # Print GPU info
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+        else:
+            print("WARNING: CUDA not available, using CPU")
         print("=" * 70)
 
         # Load model
@@ -1310,14 +1345,45 @@ def main():
         input_data, input_format = load_input_data(args.input_file)
         print(f"Loaded {len(input_data)} samples (format: {input_format})")
 
-        # Rerank
+        # Count statistics before reranking
+        total_queries = len(input_data)
+        total_docs = 0
+        total_tokens = 0
+        for sample in input_data:
+            query = sample.get('question', sample.get('query', ''))
+            paragraphs = sample.get('paragraphs', [])
+            total_docs += len(paragraphs)
+            total_tokens += len(query.split())
+            for p in paragraphs:
+                text = p.get('paragraph_text', '')
+                if args.max_doc_tokens:
+                    text = ' '.join(text.split()[:args.max_doc_tokens])
+                total_tokens += len(text.split())
+
+        # Rerank with timing
+        import time
+        start_time = time.time()
+
         results, labels_dict = rerank_with_embedding_model(
             model, model_type, input_data, input_format,
             batch_size=args.model_batch_size,
             max_doc_tokens=args.max_doc_tokens
         )
 
+        elapsed_time = time.time() - start_time
+
         print(f"\nReranked {len(results)} queries")
+
+        # Print statistics
+        if elapsed_time > 0:
+            queries_per_sec = total_queries / elapsed_time
+            docs_per_sec = total_docs / elapsed_time
+            tokens_per_sec = total_tokens / elapsed_time
+            print(f"\nStatistics:")
+            print(f"  Time: {elapsed_time:.1f}s")
+            print(f"  Queries: {total_queries} ({queries_per_sec:.1f}/s)")
+            print(f"  Documents: {total_docs} ({docs_per_sec:.1f}/s)")
+            print(f"  Tokens: {total_tokens} ({tokens_per_sec:.0f}/s)")
 
         # Load external qrels if provided
         external_qrels = None

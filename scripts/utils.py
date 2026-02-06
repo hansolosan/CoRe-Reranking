@@ -213,3 +213,43 @@ def parse_args_with_config(parser, args=None):
 
     # Second pass: parse all arguments (CLI overrides config defaults)
     return parser.parse_args(args)
+
+
+def load_cross_encoder(model_name, device=None, verbose=True):
+    """
+    Load a CrossEncoder model with proper padding token configuration.
+
+    Some models (e.g., jina-reranker) don't have a padding token defined,
+    which causes errors with batch_size > 1. This function sets pad_token
+    and pad_token_id to eos_token/eos_token_id if not defined.
+
+    Args:
+        model_name: HuggingFace model name or path
+        device: Device to load model on ('cuda', 'cpu', or None for auto)
+        verbose: Whether to print status messages
+
+    Returns:
+        CrossEncoder model instance
+    """
+    try:
+        from sentence_transformers import CrossEncoder
+    except ImportError:
+        raise ImportError(
+            "sentence-transformers is not installed. "
+            "Install with: pip install sentence-transformers"
+        )
+
+    import torch
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    model = CrossEncoder(model_name, device=device)
+
+    # Set pad_token and pad_token_id if not defined (required for batch_size > 1)
+    if model.tokenizer.pad_token is None:
+        model.tokenizer.pad_token = model.tokenizer.eos_token
+        model.tokenizer.pad_token_id = model.tokenizer.eos_token_id
+        if verbose:
+            print(f"Set pad_token to eos_token for batched inference")
+
+    return model
