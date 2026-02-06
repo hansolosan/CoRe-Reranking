@@ -215,7 +215,7 @@ def parse_args_with_config(parser, args=None):
     return parser.parse_args(args)
 
 
-def load_cross_encoder(model_name, device=None, verbose=True):
+def load_cross_encoder(model_name, device=None, trust_remote_code=True, verbose=True):
     """
     Load a CrossEncoder model with proper padding token configuration.
 
@@ -226,6 +226,7 @@ def load_cross_encoder(model_name, device=None, verbose=True):
     Args:
         model_name: HuggingFace model name or path
         device: Device to load model on ('cuda', 'cpu', or None for auto)
+        trust_remote_code: Whether to trust remote code (required for some models)
         verbose: Whether to print status messages
 
     Returns:
@@ -243,13 +244,19 @@ def load_cross_encoder(model_name, device=None, verbose=True):
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model = CrossEncoder(model_name, device=device)
+    model = CrossEncoder(model_name, device=device, trust_remote_code=trust_remote_code)
 
     # Set pad_token and pad_token_id if not defined (required for batch_size > 1)
     if model.tokenizer.pad_token is None:
         model.tokenizer.pad_token = model.tokenizer.eos_token
         model.tokenizer.pad_token_id = model.tokenizer.eos_token_id
         if verbose:
-            print(f"Set pad_token to eos_token for batched inference")
+            print(f"Set tokenizer pad_token to eos_token for batched inference")
+
+    # Also set pad_token_id in model config (some models check this)
+    if model.model.config.pad_token_id is None:
+        model.model.config.pad_token_id = model.tokenizer.pad_token_id
+        if verbose:
+            print(f"Set model.config.pad_token_id to {model.tokenizer.pad_token_id}")
 
     return model

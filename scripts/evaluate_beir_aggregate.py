@@ -303,9 +303,10 @@ def gpu_worker_embedding(
     else:
         print(f"[GPU {gpu_id}] WARNING: CUDA not available, using CPU", flush=True)
 
-    # Import sentence-transformers
+    # Import sentence-transformers and utilities
     try:
-        from sentence_transformers import SentenceTransformer, CrossEncoder
+        from sentence_transformers import SentenceTransformer
+        from utils import load_cross_encoder
     except ImportError:
         print(f"[GPU {gpu_id}] Error: sentence-transformers not installed")
         return
