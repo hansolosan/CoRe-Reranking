@@ -266,7 +266,8 @@ def gpu_worker_embedding(
     ks: List[int],
     model_batch_size: int,
     max_doc_tokens: int,
-    output_file: str
+    output_file: str,
+    output_dir: str = None
 ):
     """
     Worker function that processes multiple datasets on a specific GPU.
@@ -278,7 +279,8 @@ def gpu_worker_embedding(
         ks: K values for metrics
         model_batch_size: Batch size for inference
         max_doc_tokens: Max tokens per document
-        output_file: Path to save results JSON
+        output_file: Path to save results JSON (temp file for aggregation)
+        output_dir: Directory to save individual dataset results (enables skip logic)
     """
     import os
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -301,7 +303,38 @@ def gpu_worker_embedding(
         print(f"[GPU {gpu_id}] Error: sentence-transformers not installed")
         return
 
-    print(f"[GPU {gpu_id}] Starting worker with {len(datasets)} datasets", flush=True)
+    # Check which datasets already have results (skip if output_dir provided and file exists)
+    datasets_to_process = []
+    skipped_results = {}
+
+    for dataset_name, input_file, qrels_file in datasets:
+        if output_dir:
+            result_file = os.path.join(output_dir, f"{dataset_name}_metrics.json")
+            if os.path.exists(result_file):
+                try:
+                    with open(result_file, 'r') as f:
+                        existing = json.load(f)
+                    skipped_results[dataset_name] = {
+                        'metrics': existing.get('metrics', {}),
+                        'num_queries': existing.get('num_queries', 0),
+                        'skipped': True
+                    }
+                    continue
+                except Exception as e:
+                    print(f"[GPU {gpu_id}] Warning: Failed to load {dataset_name}: {e}", flush=True)
+        datasets_to_process.append((dataset_name, input_file, qrels_file))
+
+    if skipped_results:
+        print(f"[GPU {gpu_id}] Skipping {len(skipped_results)} datasets with existing results", flush=True)
+
+    # If all datasets were skipped, save results and return early
+    if not datasets_to_process:
+        print(f"[GPU {gpu_id}] All datasets already processed", flush=True)
+        with open(output_file, 'w') as f:
+            json.dump(skipped_results, f, indent=2)
+        return
+
+    print(f"[GPU {gpu_id}] Starting worker with {len(datasets_to_process)} datasets", flush=True)
 
     # Detect model type
     model_lower = reranker_model.lower()
@@ -322,11 +355,11 @@ def gpu_worker_embedding(
 
     print(f"[GPU {gpu_id}] Model loaded ({model_type})", flush=True)
 
-    # Process each dataset
-    results = {}
+    # Process each dataset - start with skipped results
+    results = dict(skipped_results)
 
     # Dataset-level progress bar (position 0)
-    dataset_pbar = tqdm(datasets, desc=f"GPU {gpu_id} datasets", position=gpu_id*2, leave=True)
+    dataset_pbar = tqdm(datasets_to_process, desc=f"GPU {gpu_id} datasets", position=gpu_id*2, leave=True)
 
     for dataset_name, input_file, qrels_file in dataset_pbar:
         try:
@@ -433,10 +466,17 @@ def gpu_worker_embedding(
                 except ImportError:
                     pass
 
-            results[dataset_name] = {
+            dataset_result = {
                 'metrics': dataset_metrics,
                 'num_queries': len(reranked_results)
             }
+            results[dataset_name] = dataset_result
+
+            # Save individual dataset result to output_dir
+            if output_dir:
+                result_file = os.path.join(output_dir, f"{dataset_name}_metrics.json")
+                with open(result_file, 'w') as f:
+                    json.dump(dataset_result, f, indent=2)
 
         except Exception as e:
             print(f"[GPU {gpu_id}] Error processing {dataset_name}: {e}", flush=True)
@@ -1191,7 +1231,8 @@ Example (multiple k values):
                             args.ks,
                             args.model_batch_size,
                             args.max_doc_tokens,
-                            temp_files[i]
+                            temp_files[i],
+                            str(emb_output_dir)
                         )
                     )
                     processes.append((p, i, gpu_id))
@@ -1251,48 +1292,63 @@ Example (multiple k values):
 
         else:
             # Single-process mode using subprocess (original behavior)
-            if args.verbose:
-                print(f"\nRunning evaluations on {len(dataset_files)} datasets with {args.n_jobs} parallel jobs...")
+            # Check which datasets already have results
+            datasets_to_run = []
+            skipped_results = {}
+            for dataset, input_file, qrels_file in datasets_with_qrels:
+                output_file = emb_output_dir / f"{dataset}_metrics.json"
+                if output_file.exists():
+                    skipped_results[dataset] = str(output_file)
+                else:
+                    datasets_to_run.append((dataset, input_file, qrels_file))
 
-            results = {}
+            if skipped_results:
+                if args.verbose:
+                    print(f"\nSkipping {len(skipped_results)} datasets with existing results")
+
+            if args.verbose:
+                print(f"\nRunning evaluations on {len(datasets_to_run)} datasets with {args.n_jobs} parallel jobs...")
+
+            results = dict(skipped_results)  # Start with skipped results
             failed = []
 
-            with ProcessPoolExecutor(max_workers=args.n_jobs) as executor:
-                futures = {}
-                for dataset, input_file, qrels_file in datasets_with_qrels:
-                    future = executor.submit(
-                        run_reranking_embedding,
-                        dataset,
-                        input_file,
-                        args.reranker_model,
-                        args.ks,
-                        args.evaluator,
-                        args.metrics,
-                        emb_output_dir,
-                        args.model_batch_size,
-                        args.max_doc_tokens,
-                        qrels_file
-                    )
-                    futures[future] = dataset
+            if datasets_to_run:
+                with ProcessPoolExecutor(max_workers=args.n_jobs) as executor:
+                    futures = {}
+                    for dataset, input_file, qrels_file in datasets_to_run:
+                        future = executor.submit(
+                            run_reranking_embedding,
+                            dataset,
+                            input_file,
+                            args.reranker_model,
+                            args.ks,
+                            args.evaluator,
+                            args.metrics,
+                            emb_output_dir,
+                            args.model_batch_size,
+                            args.max_doc_tokens,
+                            qrels_file
+                        )
+                        futures[future] = dataset
 
-                for future in as_completed(futures):
-                    dataset = futures[future]
-                    try:
-                        dataset_name, success, result = future.result()
-                        if success:
+                    for future in as_completed(futures):
+                        dataset = futures[future]
+                        try:
+                            dataset_name, success, result = future.result()
+                            if success:
+                                if args.verbose:
+                                    print(f"✓ {dataset_name}")
+                                results[dataset_name] = result
+                            else:
+                                if args.verbose:
+                                    print(f"✗ {dataset_name}: {result}")
+                                failed.append(dataset_name)
+                                all_failed.append(dataset_name)
+                        except Exception as e:
                             if args.verbose:
-                                print(f"✓ {dataset_name}")
-                            results[dataset_name] = result
-                        else:
-                            if args.verbose:
-                                print(f"✗ {dataset_name}: {result}")
-                            failed.append(dataset_name)
-                            all_failed.append(dataset_name)
-                    except Exception as e:
-                        if args.verbose:
-                            print(f"✗ {dataset}: {e}")
-                        failed.append(dataset)
-                        all_failed.append(dataset)
+                                print(f"✗ {dataset}: {e}")
+                            failed.append(dataset)
+                            all_failed.append(dataset)
 
             if failed and args.verbose:
                 print(f"\n⚠️  {len(failed)} datasets failed:")
