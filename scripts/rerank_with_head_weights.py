@@ -27,11 +27,11 @@ from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
 
-from utils import log_command, load_features, get_head_info, load_cross_encoder
+from utils import log_command, load_features, get_head_info, load_reranker, detect_reranker_type
 
-# Try to import sentence-transformers (optional)
+# Check if sentence-transformers is available (required for reranker models)
 try:
-    from sentence_transformers import SentenceTransformer, CrossEncoder
+    import sentence_transformers
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
@@ -393,80 +393,49 @@ def compute_fused_scores(features, weights, docs_per_query, top_k_heads=None, rr
     return fused_scores
 
 
-def detect_model_type(model_name):
-    """
-    Detect whether a model is a bi-encoder or cross-encoder based on its name.
-
-    Common cross-encoder patterns:
-    - Contains 'cross-encoder' or 'cross_encoder'
-    - Contains 'rerank' or 'reranker'
-    - BAAI/bge-reranker models
-    - ms-marco-MiniLM cross-encoder variants
-
-    Returns:
-        'cross-encoder' or 'bi-encoder'
-    """
-    model_lower = model_name.lower()
-
-    cross_encoder_patterns = [
-        'cross-encoder', 'cross_encoder', 'crossencoder',
-        'rerank', 'reranker',
-        'bge-reranker',
-        'ms-marco-minilm-l-6-v2',  # cross-encoder variant
-        'ms-marco-minilm-l-12-v2',  # cross-encoder variant
-    ]
-
-    for pattern in cross_encoder_patterns:
-        if pattern in model_lower:
-            return 'cross-encoder'
-
-    return 'bi-encoder'
-
-
 def load_reranker_model(model_name, device=None):
     """
-    Load a reranker model (bi-encoder or cross-encoder).
+    Load a reranker model using the unified reranker class hierarchy.
+
+    Supports:
+    - Cross-encoder models (e.g., BAAI/bge-reranker-v2-m3)
+    - Bi-encoder models (e.g., sentence-transformers/all-MiniLM-L6-v2)
+    - Jina reranker models (e.g., jinaai/jina-reranker-v3)
 
     Args:
         model_name: HuggingFace model name or path
         device: Device to load model on (default: auto-detect)
 
     Returns:
-        model: Loaded model
-        model_type: 'bi-encoder' or 'cross-encoder'
+        model: Loaded BaseReranker instance with unified predict() interface
+        model_type: 'bi-encoder', 'cross-encoder', or 'jina'
     """
-    if not SENTENCE_TRANSFORMERS_AVAILABLE:
-        raise ImportError(
-            "sentence-transformers is not installed. "
-            "Install with: pip install sentence-transformers"
-        )
-
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model_type = detect_model_type(model_name)
+    model_type = detect_reranker_type(model_name)
 
     print(f"Loading {model_type} model: {model_name}")
     print(f"Device: {device}")
 
-    if model_type == 'cross-encoder':
-        model = load_cross_encoder(model_name, device=device, verbose=True)
-    else:
-        model = SentenceTransformer(model_name, device=device)
+    model = load_reranker(model_name, device=device, verbose=True)
 
     return model, model_type
 
 
 def compute_embedding_scores(model, model_type, queries, documents_list, batch_size=32):
     """
-    Compute document scores using an embedding model.
+    Compute document scores using a reranker model.
+
+    Uses the unified BaseReranker interface with model.predict() method.
+    Supports cross-encoder, bi-encoder, and Jina reranker models.
 
     Args:
-        model: Loaded model (SentenceTransformer or CrossEncoder)
-        model_type: 'bi-encoder' or 'cross-encoder'
+        model: Loaded BaseReranker instance (from load_reranker)
+        model_type: 'bi-encoder', 'cross-encoder', or 'jina'
         queries: List of query texts (one per query group)
         documents_list: List of lists of document texts (one list per query)
-        batch_size: Batch size for inference
+        batch_size: Batch size for inference (ignored for Jina reranker)
 
     Returns:
         all_scores: List of score arrays, one per query
@@ -492,51 +461,24 @@ def compute_embedding_scores(model, model_type, queries, documents_list, batch_s
                     raise
 
     all_scores = []
+    desc = f"{model_type.capitalize()} scoring"
 
-    if model_type == 'cross-encoder':
-        # Cross-encoder: encode (query, doc) pairs directly
-        for idx, (query, documents) in enumerate(tqdm(zip(queries, documents_list), total=len(queries),
-                                                       desc="Cross-encoder scoring")):
-            if not documents:
-                all_scores.append(np.array([]))
-                continue
+    for idx, (query, documents) in enumerate(tqdm(zip(queries, documents_list), total=len(queries), desc=desc)):
+        if not documents:
+            all_scores.append(np.array([]))
+            continue
 
-            # Create query-document pairs
-            pairs = [(query, doc) for doc in documents]
+        # Create query-document pairs
+        pairs = [(query, doc) for doc in documents]
 
-            def compute_cross(bs):
-                return model.predict(pairs, batch_size=bs, show_progress_bar=False)
+        def compute_scores(bs):
+            return model.predict(pairs, batch_size=bs)
 
-            scores = compute_with_oom_handling(compute_cross, idx, len(documents), batch_size)
-            if scores is None:
-                # Keep original order with decreasing scores
-                scores = np.array([len(documents) - i for i in range(len(documents))], dtype=np.float32)
-            all_scores.append(np.array(scores))
-
-    else:
-        # Bi-encoder: encode queries and documents separately, compute similarity
-        print("Encoding queries...")
-        query_embeddings = model.encode(queries, batch_size=batch_size, show_progress_bar=True)
-
-        print("Encoding documents...")
-        for idx, (query_emb, documents) in enumerate(tqdm(zip(query_embeddings, documents_list),
-                                                          total=len(queries),
-                                                          desc="Computing similarities")):
-            if not documents:
-                all_scores.append(np.array([]))
-                continue
-
-            def compute_bi(bs):
-                doc_embeddings = model.encode(documents, batch_size=bs, show_progress_bar=False)
-                query_emb_norm = query_emb / np.linalg.norm(query_emb)
-                doc_emb_norms = doc_embeddings / np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
-                return np.dot(doc_emb_norms, query_emb_norm)
-
-            scores = compute_with_oom_handling(compute_bi, idx, len(documents), batch_size)
-            if scores is None:
-                # Keep original order with decreasing scores
-                scores = np.array([len(documents) - i for i in range(len(documents))], dtype=np.float32)
-            all_scores.append(scores)
+        scores = compute_with_oom_handling(compute_scores, idx, len(documents), batch_size)
+        if scores is None:
+            # Keep original order with decreasing scores
+            scores = np.array([len(documents) - i for i in range(len(documents))], dtype=np.float32)
+        all_scores.append(np.array(scores))
 
     return all_scores
 

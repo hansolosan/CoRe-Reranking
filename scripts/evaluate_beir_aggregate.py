@@ -109,7 +109,7 @@ from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
-from utils import log_command, parse_args_with_config, load_cross_encoder
+from utils import log_command, parse_args_with_config, load_reranker
 
 # Global list to track child processes for cleanup
 _child_processes = []
@@ -303,33 +303,31 @@ def gpu_worker_embedding(
     else:
         print(f"[GPU {gpu_id}] WARNING: CUDA not available, using CPU", flush=True)
 
-    # Import sentence-transformers and utilities
-    try:
-        from sentence_transformers import SentenceTransformer
-        from utils import load_cross_encoder
-    except ImportError:
-        print(f"[GPU {gpu_id}] Error: sentence-transformers not installed")
-        return
+    # Import utilities
+    from utils import load_reranker
 
-    # Check which datasets already have results (skip if output_dir provided and .json.bz2 file exists)
+    # Check which datasets already have results (skip if output_dir provided and files exist)
     datasets_to_process = []
     skipped_results = {}
 
     for dataset_name, input_file, qrels_file in datasets:
         if output_dir:
             reranked_file = os.path.join(output_dir, f"{dataset_name}.json.bz2")
-            if os.path.exists(reranked_file):
+            metrics_file = os.path.join(output_dir, f"{dataset_name}_metrics.json")
+            # Check if both reranked data and metrics files exist
+            if os.path.exists(reranked_file) and os.path.exists(metrics_file):
                 try:
-                    with bz2.open(reranked_file, 'rt', encoding='utf-8') as f:
-                        existing = json.load(f)
+                    # Load metrics from the separate metrics file (not the reranked data list)
+                    with open(metrics_file, 'r') as f:
+                        metrics_data = json.load(f)
                     skipped_results[dataset_name] = {
-                        'metrics': existing.get('metrics', {}),
-                        'num_queries': existing.get('num_queries', len(existing.get('results', {}))),
+                        'metrics': metrics_data.get('metrics', {}),
+                        'num_queries': metrics_data.get('num_queries', 0),
                         'skipped': True
                     }
                     continue
                 except Exception as e:
-                    print(f"[GPU {gpu_id}] Warning: Failed to load {dataset_name}: {e}", flush=True)
+                    print(f"[GPU {gpu_id}] Warning: Failed to load metrics for {dataset_name}: {e}", flush=True)
         datasets_to_process.append((dataset_name, input_file, qrels_file))
 
     if skipped_results:
@@ -344,24 +342,12 @@ def gpu_worker_embedding(
 
     print(f"[GPU {gpu_id}] Starting worker with {len(datasets_to_process)} datasets", flush=True)
 
-    # Detect model type
-    model_lower = reranker_model.lower()
-    is_cross_encoder = any(p in model_lower for p in [
-        'cross-encoder', 'cross_encoder', 'rerank', 'bge-reranker'
-    ])
-
-    # Load model
+    # Load model using reranker class hierarchy
     print(f"[GPU {gpu_id}] Loading model: {reranker_model}", flush=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    if is_cross_encoder:
-        model = load_cross_encoder(reranker_model, device=device, verbose=True)
-        model_type = 'cross-encoder'
-    else:
-        model = SentenceTransformer(reranker_model, device=device)
-        model_type = 'bi-encoder'
-
-    print(f"[GPU {gpu_id}] Model loaded ({model_type})", flush=True)
+    model = load_reranker(reranker_model, device=device, verbose=True)
+    print(f"[GPU {gpu_id}] Model loaded ({model.__class__.__name__})", flush=True)
 
     # Process each dataset - start with skipped results
     results = dict(skipped_results)
@@ -453,18 +439,11 @@ def gpu_worker_embedding(
                 # Compute scores with OOM handling
                 scores = None
                 current_batch_size = model_batch_size
+                pairs = [(query, doc) for doc in docs]
 
                 for attempt in range(2):  # Try twice: original batch size, then batch_size=1
                     try:
-                        if is_cross_encoder:
-                            pairs = [(query, doc) for doc in docs]
-                            scores = model.predict(pairs, batch_size=current_batch_size, show_progress_bar=False)
-                        else:
-                            query_emb = model.encode([query], show_progress_bar=False)[0]
-                            doc_embs = model.encode(docs, batch_size=current_batch_size, show_progress_bar=False)
-                            query_emb_norm = query_emb / np.linalg.norm(query_emb)
-                            doc_emb_norms = doc_embs / np.linalg.norm(doc_embs, axis=1, keepdims=True)
-                            scores = np.dot(doc_emb_norms, query_emb_norm)
+                        scores = model.predict(pairs, batch_size=current_batch_size)
                         break  # Success
                     except RuntimeError as e:
                         if 'out of memory' in str(e).lower() or 'CUDA' in str(e):

@@ -260,3 +260,231 @@ def load_cross_encoder(model_name, device=None, trust_remote_code=True, verbose=
             print(f"Set model.config.pad_token_id to {model.tokenizer.pad_token_id}")
 
     return model
+
+
+# =============================================================================
+# Reranker Class Hierarchy
+# =============================================================================
+
+class BaseReranker:
+    """Abstract base class for rerankers."""
+
+    def __init__(self, model_name, device=None, verbose=True):
+        self.model_name = model_name
+        self.verbose = verbose
+
+        import torch
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = device
+
+    def predict(self, pairs, batch_size=32):
+        """
+        Compute relevance scores for query-document pairs.
+
+        Args:
+            pairs: List of (query, document) tuples
+            batch_size: Batch size for inference
+
+        Returns:
+            numpy array of scores, one per pair
+        """
+        raise NotImplementedError
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(model_name='{self.model_name}', device='{self.device}')"
+
+
+class CrossEncoderReranker(BaseReranker):
+    """Reranker using sentence-transformers CrossEncoder."""
+
+    def __init__(self, model_name, device=None, trust_remote_code=True, verbose=True):
+        super().__init__(model_name, device, verbose)
+
+        from sentence_transformers import CrossEncoder
+
+        self.model = CrossEncoder(model_name, device=self.device, trust_remote_code=trust_remote_code)
+
+        # Set pad_token and pad_token_id if not defined (required for batch_size > 1)
+        if self.model.tokenizer.pad_token is None:
+            self.model.tokenizer.pad_token = self.model.tokenizer.eos_token
+            self.model.tokenizer.pad_token_id = self.model.tokenizer.eos_token_id
+            if verbose:
+                print(f"Set tokenizer pad_token to eos_token for batched inference")
+
+        # Also set pad_token_id in model config (some models check this)
+        if self.model.model.config.pad_token_id is None:
+            self.model.model.config.pad_token_id = self.model.tokenizer.pad_token_id
+            if verbose:
+                print(f"Set model.config.pad_token_id to {self.model.tokenizer.pad_token_id}")
+
+    def predict(self, pairs, batch_size=32):
+        return self.model.predict(pairs, batch_size=batch_size, show_progress_bar=False)
+
+
+class BiEncoderReranker(BaseReranker):
+    """Reranker using sentence-transformers SentenceTransformer (bi-encoder)."""
+
+    def __init__(self, model_name, device=None, verbose=True):
+        super().__init__(model_name, device, verbose)
+
+        from sentence_transformers import SentenceTransformer
+        import numpy as np
+
+        self.model = SentenceTransformer(model_name, device=self.device)
+        self.np = np
+
+    def predict(self, pairs, batch_size=32):
+        queries = [p[0] for p in pairs]
+        docs = [p[1] for p in pairs]
+
+        # Encode queries and documents
+        query_embs = self.model.encode(queries, batch_size=batch_size, show_progress_bar=False)
+        doc_embs = self.model.encode(docs, batch_size=batch_size, show_progress_bar=False)
+
+        # Compute cosine similarity
+        query_norms = query_embs / self.np.linalg.norm(query_embs, axis=1, keepdims=True)
+        doc_norms = doc_embs / self.np.linalg.norm(doc_embs, axis=1, keepdims=True)
+        scores = (query_norms * doc_norms).sum(axis=1)
+
+        return scores
+
+
+class JinaReranker(BaseReranker):
+    """Reranker for Jina reranker models (v3+) that use AutoModel with built-in rerank method."""
+
+    def __init__(self, model_name, device=None, trust_remote_code=True, verbose=True,
+                 max_doc_length=2048, max_query_length=512):
+        super().__init__(model_name, device, verbose)
+
+        from transformers import AutoModel
+        import numpy as np
+
+        self.np = np
+        self.max_doc_length = max_doc_length
+        self.max_query_length = max_query_length
+
+        if verbose:
+            print(f"Loading Jina reranker: {model_name}")
+
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            torch_dtype='auto',
+            trust_remote_code=trust_remote_code,
+        )
+        self.model.to(self.device)
+        self.model.eval()
+
+    def predict(self, pairs, batch_size=32):
+        """
+        Compute relevance scores for query-document pairs.
+
+        Note: Jina reranker v3 uses its own rerank() method which processes
+        one query at a time with multiple documents. The batch_size parameter
+        is ignored since the model doesn't support batched decoding in the
+        traditional sense.
+
+        Args:
+            pairs: List of (query, document) tuples
+            batch_size: Ignored for Jina reranker (kept for API compatibility)
+
+        Returns:
+            numpy array of scores, one per pair
+        """
+        import numpy as np
+
+        # Group pairs by query
+        query_to_docs = {}
+        query_to_indices = {}
+        for idx, (query, doc) in enumerate(pairs):
+            if query not in query_to_docs:
+                query_to_docs[query] = []
+                query_to_indices[query] = []
+            query_to_docs[query].append(doc)
+            query_to_indices[query].append(idx)
+
+        # Process each query
+        scores = np.zeros(len(pairs))
+        for query, docs in query_to_docs.items():
+            results = self.model.rerank(
+                query, docs,
+                max_doc_length=self.max_doc_length,
+                max_query_length=self.max_query_length
+            )
+            # Map scores back to original indices
+            indices = query_to_indices[query]
+            for result in results:
+                original_idx = indices[result['index']]
+                scores[original_idx] = result['relevance_score']
+
+        return scores
+
+
+# Models that require specific reranker classes
+JINA_RERANKER_MODELS = [
+    'jina-reranker-v3',
+]
+
+
+def detect_reranker_type(model_name):
+    """
+    Detect the appropriate reranker type for a model.
+
+    Args:
+        model_name: HuggingFace model name
+
+    Returns:
+        str: 'jina', 'cross-encoder', or 'bi-encoder'
+    """
+    model_lower = model_name.lower()
+
+    # Check for Jina reranker models
+    for pattern in JINA_RERANKER_MODELS:
+        if pattern in model_lower:
+            return 'jina'
+
+    # Check for cross-encoder patterns
+    cross_encoder_patterns = ['cross-encoder', 'cross_encoder', 'rerank', 'bge-reranker']
+    if any(p in model_lower for p in cross_encoder_patterns):
+        return 'cross-encoder'
+
+    # Default to bi-encoder
+    return 'bi-encoder'
+
+
+def load_reranker(model_name, device=None, trust_remote_code=True, verbose=True,
+                  max_length=512, max_doc_length=2048, max_query_length=512):
+    """
+    Load the appropriate reranker for a model.
+
+    Automatically detects whether to use CrossEncoder, JinaReranker,
+    or BiEncoder based on the model name.
+
+    Args:
+        model_name: HuggingFace model name or path
+        device: Device to load model on ('cuda', 'cpu', or None for auto)
+        trust_remote_code: Whether to trust remote code
+        verbose: Whether to print status messages
+        max_length: Max sequence length (for CrossEncoder)
+        max_doc_length: Max document length (for JinaReranker)
+        max_query_length: Max query length (for JinaReranker)
+
+    Returns:
+        BaseReranker instance
+    """
+    reranker_type = detect_reranker_type(model_name)
+
+    if verbose:
+        print(f"Detected reranker type: {reranker_type}")
+
+    if reranker_type == 'jina':
+        return JinaReranker(
+            model_name, device=device, trust_remote_code=trust_remote_code,
+            verbose=verbose, max_doc_length=max_doc_length, max_query_length=max_query_length
+        )
+    elif reranker_type == 'cross-encoder':
+        return CrossEncoderReranker(
+            model_name, device=device, trust_remote_code=trust_remote_code, verbose=verbose
+        )
+    else:
+        return BiEncoderReranker(model_name, device=device, verbose=verbose)
