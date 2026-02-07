@@ -393,7 +393,7 @@ def compute_fused_scores(features, weights, docs_per_query, top_k_heads=None, rr
     return fused_scores
 
 
-def load_reranker_model(model_name, device=None):
+def load_reranker_model(model_name, device=None, model_kwargs=None):
     """
     Load a reranker model using the unified reranker class hierarchy.
 
@@ -418,7 +418,7 @@ def load_reranker_model(model_name, device=None):
     print(f"Loading {model_type} model: {model_name}")
     print(f"Device: {device}")
 
-    model = load_reranker(model_name, device=device, verbose=True)
+    model = load_reranker(model_name, device=device, verbose=True, model_kwargs=model_kwargs)
 
     return model, model_type
 

@@ -215,7 +215,7 @@ def parse_args_with_config(parser, args=None):
     return parser.parse_args(args)
 
 
-def load_cross_encoder(model_name, device=None, trust_remote_code=True, verbose=True):
+def load_cross_encoder(model_name, device=None, trust_remote_code=True, verbose=True, model_kwargs=None):
     """
     Load a CrossEncoder model with proper padding token configuration.
 
@@ -228,10 +228,13 @@ def load_cross_encoder(model_name, device=None, trust_remote_code=True, verbose=
         device: Device to load model on ('cuda', 'cpu', or None for auto)
         trust_remote_code: Whether to trust remote code (required for some models)
         verbose: Whether to print status messages
+        model_kwargs: Additional keyword arguments to pass to CrossEncoder constructor
 
     Returns:
         CrossEncoder model instance
     """
+    if model_kwargs is None:
+        model_kwargs = {}
     try:
         from sentence_transformers import CrossEncoder
     except ImportError:
@@ -244,7 +247,7 @@ def load_cross_encoder(model_name, device=None, trust_remote_code=True, verbose=
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    model = CrossEncoder(model_name, device=device, trust_remote_code=trust_remote_code)
+    model = CrossEncoder(model_name, device=device, trust_remote_code=trust_remote_code, model_kwargs=model_kwargs)
 
     # Set pad_token and pad_token_id if not defined (required for batch_size > 1)
     if model.tokenizer.pad_token is None:
@@ -269,9 +272,10 @@ def load_cross_encoder(model_name, device=None, trust_remote_code=True, verbose=
 class BaseReranker:
     """Abstract base class for rerankers."""
 
-    def __init__(self, model_name, device=None, verbose=True):
+    def __init__(self, model_name, device=None, verbose=True, model_kwargs=None):
         self.model_name = model_name
         self.verbose = verbose
+        self.model_kwargs = model_kwargs if model_kwargs is not None else {}
 
         import torch
         if device is None:
@@ -298,12 +302,15 @@ class BaseReranker:
 class CrossEncoderReranker(BaseReranker):
     """Reranker using sentence-transformers CrossEncoder."""
 
-    def __init__(self, model_name, device=None, trust_remote_code=True, verbose=True):
-        super().__init__(model_name, device, verbose)
+    def __init__(self, model_name, device=None, trust_remote_code=True, verbose=True, model_kwargs=None):
+        super().__init__(model_name, device, verbose, model_kwargs)
 
         from sentence_transformers import CrossEncoder
 
-        self.model = CrossEncoder(model_name, device=self.device, trust_remote_code=trust_remote_code)
+        self.model = CrossEncoder(model_name,
+                                  device=self.device,
+                                  trust_remote_code=trust_remote_code,
+                                  model_kwargs=self.model_kwargs)
 
         # Set pad_token and pad_token_id if not defined (required for batch_size > 1)
         if self.model.tokenizer.pad_token is None:
@@ -325,13 +332,13 @@ class CrossEncoderReranker(BaseReranker):
 class BiEncoderReranker(BaseReranker):
     """Reranker using sentence-transformers SentenceTransformer (bi-encoder)."""
 
-    def __init__(self, model_name, device=None, verbose=True):
-        super().__init__(model_name, device, verbose)
+    def __init__(self, model_name, device=None, verbose=True, model_kwargs=None):
+        super().__init__(model_name, device, verbose, model_kwargs)
 
         from sentence_transformers import SentenceTransformer
         import numpy as np
 
-        self.model = SentenceTransformer(model_name, device=self.device)
+        self.model = SentenceTransformer(model_name, device=self.device, model_kwargs=self.model_kwargs)
         self.np = np
 
     def predict(self, pairs, batch_size=32):
@@ -354,8 +361,8 @@ class JinaReranker(BaseReranker):
     """Reranker for Jina reranker models (v3+) that use AutoModel with built-in rerank method."""
 
     def __init__(self, model_name, device=None, trust_remote_code=True, verbose=True,
-                 max_doc_length=2048, max_query_length=512):
-        super().__init__(model_name, device, verbose)
+                 max_doc_length=2048, max_query_length=512, model_kwargs=None):
+        super().__init__(model_name, device, verbose, model_kwargs)
 
         from transformers import AutoModel
         import numpy as np
@@ -453,7 +460,7 @@ def detect_reranker_type(model_name):
 
 
 def load_reranker(model_name, device=None, trust_remote_code=True, verbose=True,
-                  max_length=512, max_doc_length=2048, max_query_length=512):
+                  max_length=512, max_doc_length=2048, max_query_length=512, model_kwargs=None):
     """
     Load the appropriate reranker for a model.
 
@@ -468,6 +475,7 @@ def load_reranker(model_name, device=None, trust_remote_code=True, verbose=True,
         max_length: Max sequence length (for CrossEncoder)
         max_doc_length: Max document length (for JinaReranker)
         max_query_length: Max query length (for JinaReranker)
+        model_kwargs: Additional keyword arguments to pass to model constructors
 
     Returns:
         BaseReranker instance
@@ -480,11 +488,13 @@ def load_reranker(model_name, device=None, trust_remote_code=True, verbose=True,
     if reranker_type == 'jina':
         return JinaReranker(
             model_name, device=device, trust_remote_code=trust_remote_code,
-            verbose=verbose, max_doc_length=max_doc_length, max_query_length=max_query_length
+            verbose=verbose, max_doc_length=max_doc_length, max_query_length=max_query_length,
+            model_kwargs=model_kwargs
         )
     elif reranker_type == 'cross-encoder':
         return CrossEncoderReranker(
-            model_name, device=device, trust_remote_code=trust_remote_code, verbose=verbose
+            model_name, device=device, trust_remote_code=trust_remote_code, verbose=verbose,
+            model_kwargs=model_kwargs
         )
     else:
-        return BiEncoderReranker(model_name, device=device, verbose=verbose)
+        return BiEncoderReranker(model_name, device=device, verbose=verbose, model_kwargs=model_kwargs)
