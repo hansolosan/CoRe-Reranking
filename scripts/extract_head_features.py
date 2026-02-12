@@ -178,6 +178,12 @@ class HFFeatureExtractor(BaseFeatureExtractor):
         self._num_head = self.llm.config.num_attention_heads
         print(f"Model loaded: {self._num_layer} layers, {self._num_head} heads", flush=True)
 
+        # Truncation tracking
+        self._docs_truncated = 0
+        self._docs_total = 0
+        self._queries_truncated = 0
+        self._queries_total = 0
+
     @property
     def num_layer(self):
         return self._num_layer
@@ -185,6 +191,96 @@ class HFFeatureExtractor(BaseFeatureExtractor):
     @property
     def num_head(self):
         return self._num_head
+
+    def get_truncation_stats(self):
+        """Get truncation statistics."""
+        return {
+            'docs_truncated': self._docs_truncated,
+            'docs_total': self._docs_total,
+            'docs_truncated_pct': (self._docs_truncated / self._docs_total * 100) if self._docs_total > 0 else 0,
+            'queries_truncated': self._queries_truncated,
+            'queries_total': self._queries_total,
+            'queries_truncated_pct': (self._queries_truncated / self._queries_total * 100) if self._queries_total > 0 else 0,
+        }
+
+    def reset_truncation_stats(self):
+        """Reset truncation counters."""
+        self._docs_truncated = 0
+        self._docs_total = 0
+        self._queries_truncated = 0
+        self._queries_total = 0
+
+    def _prepare_query(self, query, max_query_tokens):
+        """
+        Prepare query text, truncating if needed.
+
+        Args:
+            query: query text
+            max_query_tokens: maximum words (None = no limit)
+
+        Returns:
+            Processed query string
+        """
+        self._queries_total += 1
+        if max_query_tokens is not None:
+            query_words = query.split()
+            if len(query_words) > max_query_tokens:
+                query = ' '.join(query_words[:max_query_tokens])
+                self._queries_truncated += 1
+        return query
+
+    def _count_leading_pad_tokens(self, token_ids):
+        """
+        Count leading padding tokens in a sequence.
+
+        Args:
+            token_ids: tensor of token IDs
+
+        Returns:
+            Number of padding tokens at the start
+        """
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+
+        count = 0
+        for t in token_ids:
+            if t == pad_token_id:
+                count += 1
+            else:
+                break
+        return count
+
+    def _prepare_documents(self, documents, max_doc_tokens):
+        """
+        Prepare document texts, truncating if needed.
+
+        Uses .strip() only to match head_detection.py behavior.
+        Only normalizes whitespace (split/join) when truncation is needed.
+
+        Args:
+            documents: list of document dicts with 'paragraph_text'
+            max_doc_tokens: maximum words per document
+
+        Returns:
+            List of document dicts with processed 'paragraph_text'
+        """
+        truncated_docs = []
+        for doc in documents:
+            text = doc.get('paragraph_text', '')
+            if isinstance(text, str):
+                text = text.strip()
+                words = text.split()
+                self._docs_total += 1
+                if len(words) > max_doc_tokens:
+                    self._docs_truncated += 1
+                    # Only normalize whitespace when truncating
+                    text = ' '.join(words[:max_doc_tokens])
+            else:
+                text = ''
+                self._docs_total += 1
+            truncated_docs.append({'paragraph_text': text})
+        return truncated_docs
 
     def _extract_raw_features(self, query, truncated_docs, doc_spans, kv_cache=None, context_start_idx=0):
         """
@@ -278,19 +374,8 @@ class HFFeatureExtractor(BaseFeatureExtractor):
         Returns:
             features: np.array of shape (num_docs, num_layers * num_heads)
         """
-        # Truncate query if needed
-        if max_query_tokens is not None:
-            query_words = query.split()
-            if len(query_words) > max_query_tokens:
-                query = ' '.join(query_words[:max_query_tokens])
-
-        # Truncate documents
-        truncated_docs = []
-        for doc in documents:
-            text = doc.get('paragraph_text', '')
-            # Simple word-based truncation
-            words = text.split()[:max_doc_tokens] if isinstance(text, str) else []
-            truncated_docs.append({'paragraph_text': ' '.join(words)})
+        query = self._prepare_query(query, max_query_tokens)
+        truncated_docs = self._prepare_documents(documents, max_doc_tokens)
 
         # Get document spans and query span (consistent for both query and N/A)
         _, doc_spans, query_span = self.prepare_input(query, truncated_docs)
@@ -351,18 +436,8 @@ class HFFeatureExtractor(BaseFeatureExtractor):
         all_truncated_docs = []
 
         for query, documents in zip(queries, documents_list):
-            # Truncate query if needed
-            if max_query_tokens is not None:
-                query_words = query.split()
-                if len(query_words) > max_query_tokens:
-                    query = ' '.join(query_words[:max_query_tokens])
-
-            # Truncate documents
-            truncated_docs = []
-            for doc in documents:
-                text = doc.get('paragraph_text', '')
-                words = text.split()[:max_doc_tokens]
-                truncated_docs.append({'paragraph_text': ' '.join(words)})
+            query = self._prepare_query(query, max_query_tokens)
+            truncated_docs = self._prepare_documents(documents, max_doc_tokens)
             all_truncated_docs.append(truncated_docs)
 
             prompt, doc_spans, query_span = self.prepare_input(query, truncated_docs)
@@ -398,43 +473,24 @@ class HFFeatureExtractor(BaseFeatureExtractor):
             input_ids_na = tokenized_na.input_ids
 
         # Adjust spans for padding (left padding for causal LMs)
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = self.tokenizer.eos_token_id
-
         adjusted_query_spans = []
         adjusted_query_spans_na = []
         adjusted_doc_spans = []
 
         for b in range(batch_size):
-            # Count padding tokens at the start for query prompts
-            seq = input_ids[b]
-            pad_offset = 0
-            for t in seq:
-                if t == pad_token_id:
-                    pad_offset += 1
-                else:
-                    break
+            pad_offset = self._count_leading_pad_tokens(input_ids[b])
 
             # Adjust spans for query
             q_start, q_end = all_query_spans[b]
             adjusted_query_spans.append((q_start + pad_offset, q_end + pad_offset))
 
-            adj_doc_spans = []
-            for d_start, d_end in all_doc_spans[b]:
-                adj_doc_spans.append((d_start + pad_offset, d_end + pad_offset))
+            adj_doc_spans = [(d_start + pad_offset, d_end + pad_offset)
+                             for d_start, d_end in all_doc_spans[b]]
             adjusted_doc_spans.append(adj_doc_spans)
 
             # Adjust spans for N/A prompts if calibrating
             if self.calibrate:
-                seq_na = input_ids_na[b]
-                pad_offset_na = 0
-                for t in seq_na:
-                    if t == pad_token_id:
-                        pad_offset_na += 1
-                    else:
-                        break
-
+                pad_offset_na = self._count_leading_pad_tokens(input_ids_na[b])
                 q_start_na, q_end_na = all_query_spans_na[b]
                 adjusted_query_spans_na.append((q_start_na + pad_offset_na, q_end_na + pad_offset_na))
 
@@ -1685,6 +1741,12 @@ def main():
     print(f"Queries processed: {len(docs_per_query)}", flush=True)
     print(f"Docs per query: min={min(docs_per_query)}, max={max(docs_per_query)}, avg={np.mean(docs_per_query):.1f}", flush=True)
 
+    # Print truncation statistics
+    truncation_stats = extractor.get_truncation_stats()
+    print(f"\nTruncation statistics (max_doc_tokens={args.max_doc_tokens}, max_query_tokens={args.max_query_tokens}):", flush=True)
+    print(f"  Documents truncated: {truncation_stats['docs_truncated']}/{truncation_stats['docs_total']} ({truncation_stats['docs_truncated_pct']:.1f}%)", flush=True)
+    print(f"  Queries truncated: {truncation_stats['queries_truncated']}/{truncation_stats['queries_total']} ({truncation_stats['queries_truncated_pct']:.1f}%)", flush=True)
+
     # Determine output path
     if args.output_dir is not None:
         output_dir = Path(args.output_dir)
@@ -1749,6 +1811,14 @@ def main():
             'positive': int(n_positive),
             'negative': int(n_negative),
             'unknown': int(n_unknown)
+        },
+        'truncation_stats': {
+            'docs_truncated': truncation_stats['docs_truncated'],
+            'docs_total': truncation_stats['docs_total'],
+            'docs_truncated_pct': truncation_stats['docs_truncated_pct'],
+            'queries_truncated': truncation_stats['queries_truncated'],
+            'queries_total': truncation_stats['queries_total'],
+            'queries_truncated_pct': truncation_stats['queries_truncated_pct'],
         },
         'memory_stats': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
                         for k, v in (memory_stats or {}).items()}

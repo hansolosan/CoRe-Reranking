@@ -705,6 +705,14 @@ Examples:
     n_unknown = int((all_labels == -1).sum())
     print(f"Label distribution: {n_positive} positive, {n_negative} negative, {n_unknown} unknown")
 
+    # Print truncation statistics (single-GPU mode only)
+    truncation_stats = None
+    if args.gpus is None and hasattr(extractor, 'get_truncation_stats'):
+        truncation_stats = extractor.get_truncation_stats()
+        print(f"\nTruncation statistics (max_doc_tokens={args.max_doc_tokens}, max_query_tokens={args.max_query_tokens}):")
+        print(f"  Documents truncated: {truncation_stats['docs_truncated']}/{truncation_stats['docs_total']} ({truncation_stats['docs_truncated_pct']:.1f}%)")
+        print(f"  Queries truncated: {truncation_stats['queries_truncated']}/{truncation_stats['queries_total']} ({truncation_stats['queries_truncated_pct']:.1f}%)")
+
     # Determine output directory and name
     if args.output_dir:
         output_dir = Path(args.output_dir)
@@ -791,6 +799,7 @@ Examples:
             'negative': n_negative,
             'unknown': n_unknown
         },
+        'truncation_stats': truncation_stats,  # None in multi-GPU mode
     }
 
     with open(metadata_file, 'w') as f:
