@@ -116,7 +116,7 @@ class HeadDetector():
             self.head_score[head] /= self.num_query
         return self.head_score
 
-    def compute_retrieval_score(self, query, documents, pos_idx, neg_idx):
+    def compute_retrieval_score(self, query, documents, pos_idx, neg_idx, return_features=False):
         """
         Compute and accumulate retrieval scores for all heads on one query.
 
@@ -128,19 +128,41 @@ class HeadDetector():
             documents: List of document text strings
             pos_idx: Index of the positive document in documents list
             neg_idx: List of indices of hard negative documents in documents list
+            return_features: If True, also return raw per-document attention features
+
+        Returns:
+            If return_features=False: None
+            If return_features=True: dict with:
+                - 'features': np.array of shape (num_docs, num_layers * num_heads)
+                - 'labels': np.array of shape (num_docs,) with 1=positive, 0=negative, -1=other
 
         Side effects:
             Updates self.head_score by adding scores for this query
             Increments self.num_query counter
         """
-        prompt, pos_span, neg_span, query_span = self.prepare_input(query, documents, pos_idx, neg_idx)
-        score = self.score_documents(prompt, pos_span, neg_span, query_span)
+        prompt, pos_span, neg_span, query_span, all_doc_spans = self.prepare_input(query, documents, pos_idx, neg_idx)
+        score, doc_features = self.score_documents(prompt, pos_span, neg_span, query_span,
+                                                    return_features=return_features,
+                                                    all_doc_spans=all_doc_spans)
         for layer in range(self.num_layer):
             for head in range(self.num_head):
                 self.head_score[f"{layer}-{head}"] += score[layer, head].item()
         self.num_query += 1
 
-    def score_documents(self, prompt, pos_span, neg_span, query_span):
+        if return_features and doc_features is not None:
+            import numpy as np
+            # Create labels array: 1=positive, 0=negative, -1=other
+            labels = np.full(len(documents), -1, dtype=np.int32)
+            labels[pos_idx] = 1
+            for idx in neg_idx:
+                labels[idx] = 0
+            return {
+                'features': doc_features,
+                'labels': labels
+            }
+        return None
+
+    def score_documents(self, prompt, pos_span, neg_span, query_span, return_features=False, all_doc_spans=None):
         """
         Score documents using contrastive attention.
 
@@ -153,12 +175,15 @@ class HeadDetector():
             pos_span: Tuple (start_idx, end_idx) of positive document tokens
             neg_span: List of tuples (start_idx, end_idx) for negative document tokens
             query_span: Tuple (start_idx, end_idx) of query tokens
+            return_features: If True, also return raw per-document attention features
+            all_doc_spans: List of all document spans (required if return_features=True)
 
         Returns:
-            torch.Tensor: Contrastive scores of shape (num_layer, num_head).
-                          Each value is in [0, 1] from softmax over positive and
-                          negative documents. Higher = head focuses more on positive.
+            head_scores: torch.Tensor of shape (num_layer, num_head) with contrastive scores
+            doc_features: np.array of shape (num_docs, num_layers * num_heads) if return_features=True, else None
         """
+        import numpy as np
+
         tokenized_input = self.tokenizer(prompt,return_tensors='pt').to(self.llm.device)
         _input_ids = tokenized_input.input_ids
         _query_indices = list(range(query_span[0], query_span[1]+1))
@@ -190,6 +215,15 @@ class HeadDetector():
         torch.cuda.empty_cache()
         attn_weights = attn_weights.mean(-2)
 
+        # Extract raw per-document attention features if requested
+        doc_features = None
+        if return_features and all_doc_spans is not None:
+            num_docs = len(all_doc_spans)
+            doc_features = np.zeros((num_docs, self.num_layer * self.num_head), dtype=np.float32)
+            for doc_idx, (start, end) in enumerate(all_doc_spans):
+                doc_attn = attn_weights[:, :, start:end].sum(-1)  # (num_layer, num_head)
+                doc_features[doc_idx] = doc_attn.cpu().numpy().flatten()
+
         # compute contrastive score
         pos_score = attn_weights[:,:,pos_span[0]:pos_span[1]].sum(-1)
         all_neg_score = []
@@ -204,7 +238,7 @@ class HeadDetector():
         del attn_weights, pos_score
         torch.cuda.empty_cache()
 
-        return head_scores
+        return head_scores, doc_features
 
     def prepare_input(self, query, documents, pos_idx, neg_idx):
         """
@@ -221,13 +255,15 @@ class HeadDetector():
             neg_idx: List of indices of hard negative documents in documents list
 
         Returns:
-            tuple: (llm_prompt, pos_span, neg_span, query_span) where:
+            tuple: (llm_prompt, pos_span, neg_span, query_span, all_doc_spans) where:
                 - llm_prompt: Full formatted prompt string
                 - pos_span: Tuple (start_idx, end_idx) of positive document tokens
                 - neg_span: List of tuples for negative document token spans
                 - query_span: Tuple (start_idx, end_idx) of query tokens
+                - all_doc_spans: List of (start_idx, end_idx) tuples for all documents
         """
         neg_span = [] # hard negatives
+        all_doc_spans = []  # all document spans
         llm_prompt = self.prompt_prefix + self.retrieval_instruction
 
         for i, doc in enumerate(documents):
@@ -237,6 +273,7 @@ class HeadDetector():
             llm_prompt += ' ' + doc
             end_len = len(self.tokenizer(llm_prompt).input_ids) - self.offset
 
+            all_doc_spans.append((start_len, end_len))
             if i == pos_idx:
                 pos_span = (start_len, end_len)
             if i in neg_idx:
@@ -251,7 +288,7 @@ class HeadDetector():
 
         query_span = (start_len, end_len)
 
-        return llm_prompt, pos_span, neg_span, query_span
+        return llm_prompt, pos_span, neg_span, query_span, all_doc_spans
 
     @classmethod
     def _get_attn_weights(cls, key_states, query_states):

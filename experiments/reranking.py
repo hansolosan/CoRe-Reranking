@@ -23,6 +23,8 @@ parser.add_argument('--temp', type=float, default=0.001)
 parser.add_argument('--prune', type=float, default=0.0)
 parser.add_argument('--num_head', type=int, default=8)
 parser.add_argument('--batch_size', type=int, default=1, help='Batch size for reranking multiple queries simultaneously')
+parser.add_argument('--max_doc_tokens', type=int, default=300,
+                    help='Maximum words per document (default: 300)')
 args = parser.parse_args()
 
 # best temperature found, change if needed
@@ -95,9 +97,12 @@ def main():
             if not isinstance(p['paragraph_text'], str):
                 p['paragraph_text'] = str(p['paragraph_text'])
 
-        # truncate document, comment out if not needed
-        for p in paragraphs:
-            p['paragraph_text'] = ' '.join(p['paragraph_text'].split(' ')[:300])
+        # truncate document if max_doc_tokens is set
+        if args.max_doc_tokens is not None:
+            for p in paragraphs:
+                words = p['paragraph_text'].split()
+                if len(words) > args.max_doc_tokens:
+                    p['paragraph_text'] = ' '.join(words[:args.max_doc_tokens])
 
         documents = [(p['paragraph_text']).strip() for p in paragraphs]
         batch_queries.append((question, documents))
